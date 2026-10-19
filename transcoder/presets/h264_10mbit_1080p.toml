@@ -1,0 +1,20 @@
+container = "mp4"
+faststart = true
+
+[video]
+codec       = "libx264"
+profile     = "high"
+pix_fmt     = "yuv420p"
+color       = "bt709"
+bitrate     = "10M"
+maxrate     = "10.5M"
+bufsize     = "20M"
+x264_preset = "medium"
+frame       = "1920x1080"
+scan        = "progressive"
+
+[audio]
+codec       = "aac"
+bitrate     = "320k"
+sample_rate = 48000
+layout      = "stereo"

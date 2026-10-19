@@ -1,0 +1,440 @@
+"""Preparation of outputs (preset, fixes, segments, timecode), ffmpeg filter graph and the render run."""
+# --------- IMPORTS ---------
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from fractions import Fraction
+from pathlib import Path
+import math
+import os
+import subprocess
+import tempfile
+import time
+from . import _analysis, _media, _presets
+from ._source import Source, open_source
+
+
+# --------- CONFIG ---------
+part_suffix = ".part"
+script_from = 8000                  # longer filter graphs go into a script file (command line limit on Windows)
+progress_interval = 0.5             # seconds between progress messages
+
+
+# --------- STATIC ---------
+replaced_fix = {"crop": "black_bars", "deinterlace": "interlace", "audio_map": "audio"}   # change kind: fix it replaces
+
+
+# --------- TYPES ---------
+class PrepareError(Exception):
+    """Output cannot be rendered; errors are (step, text) pairs."""
+    def __init__(self, errors: list[tuple[str, str]]) -> None:
+        super().__init__("; ".join(f"{step}: {text}" for step, text in errors))
+        self.errors = errors
+
+
+@dataclass
+class Plan:
+    """Everything needed to render one output."""
+    output: object
+    preset_name: str
+    preset: dict
+    target: Path
+    frame: tuple[int, int, Fraction]
+    field: str | None                       # "tff"/"bff" for interlaced outputs
+    deinterlace: bool
+    crop: tuple[int, int, int, int] | None
+    tracks: list[list[int]]                 # per output audio track: source channel numbers
+    rate: int
+    bits: int
+    segments: list[tuple]                   # ("file", Source, input) | ("black", seconds) | ("source",)
+    start_tc: str
+    duration: float
+    fixes: list[dict] = field(default_factory=list)
+    modify: list[str] = field(default_factory=list)
+    command: list[str] = field(default_factory=list)
+
+    @property
+    def part(self) -> Path:
+        return self.target.with_name(self.target.name + part_suffix)
+
+
+# --------- FUNC GEOMETRY ---------
+def _raster(width: int, height: int, sar: Fraction, rasters: list[str]) -> tuple[int, int]:
+    """Raster of a picture: its own size if it is one; else of all rasters holding the displayed picture the one
+    with the closest aspect ratio (then the smaller one); the largest raster for bigger pictures."""
+    sizes = [_presets.frame_size(item) for item in rasters]
+    if (width, height) in sizes:
+        return width, height
+    shown = float(width * sar)
+    holding = [size for size in sizes if size[0] >= shown - 1 and size[1] >= height]
+    if not holding:
+        return max(sizes, key=lambda size: size[0] * size[1])
+    return min(holding, key=lambda size: (round(abs(math.log(size[0] / size[1] / (shown / height))), 3),
+                                          size[0] * size[1]))
+
+
+def _frame(source: Source, preset: dict, crop: tuple[int, int, int, int] | None) -> tuple[int, int, Fraction]:
+    """Frame of the output; with frame = "raster" the raster of the picture after cropping."""
+    frame = preset["video"]["frame"]
+    if frame == "source":
+        return source.width, source.height, source.sar
+    if frame == "raster":
+        width, height = (crop[2], crop[3]) if crop else (source.width, source.height)
+        return (*_raster(width, height, source.sar, preset["video"]["rasters"]), Fraction(1))
+    return (*_presets.frame_size(frame), Fraction(1))
+
+
+def _even(value: float) -> int:
+    return max(2, int(round(value / 2)) * 2)
+
+
+def fit(width: int, height: int, sar: Fraction, frame: tuple[int, int, Fraction]) -> tuple[int, int]:
+    """Stored size of a width×height picture with sar fitted into frame without cropping."""
+    frame_width, frame_height, frame_sar = frame
+    display = width * sar
+    scale = min(frame_width * frame_sar / display, Fraction(frame_height, height))
+    return min(frame_width, _even(display * scale / frame_sar)), min(frame_height, _even(height * scale))
+
+
+# --------- FUNC PREPARE ---------
+def _bits(source: Source, preset: dict) -> int:
+    wanted = preset["audio"].get("bit_depth", "source")
+    if wanted != "source":
+        return wanted
+    data = source.audio[0].data if source.audio else {}
+    bits = int(_media.number(data.get("bits_per_raw_sample")) or 0) or {"s16": 16, "s16p": 16}.get(data.get("sample_fmt"), 24)
+    return 16 if bits <= 16 else 24
+
+
+def _segments(source: Source, merge, frame: tuple[int, int, Fraction], exact: bool,
+              errors: list[tuple[str, str]], cache: dict) -> list[tuple]:
+    from .transcoder import SOURCE, _Black
+    items = list(merge) or [SOURCE]
+    if items.count(SOURCE) != 1:
+        errors.append(("merge", "merge braucht SOURCE genau einmal"))
+        return []
+    segments = []
+    for item in items:
+        if item is SOURCE:
+            segments.append(("source",))
+        elif isinstance(item, _Black):
+            segments.append(("black", item.seconds))
+        elif isinstance(item, (str, Path)):
+            path = Path(item)
+            try:
+                segment = cache.setdefault(path.resolve(), open_source([path], None))
+            except (OSError, RuntimeError, ValueError) as exc:
+                errors.append(("merge", f"{path.name}: {exc}"))
+                continue
+            if not segment.video:
+                errors.append(("merge", f"{path.name}: kein Video"))
+            elif segment.fps != source.fps:
+                errors.append(("merge", f"{path.name}: {float(segment.fps or 0):g} fps, Source {float(source.fps):g} fps"))
+            elif exact and (segment.width, segment.height) != frame[:2]:
+                errors.append(("merge", f"{path.name}: {segment.width}×{segment.height}, Output {frame[0]}×{frame[1]}"))
+            else:
+                segments.append(("file", segment))
+        else:
+            errors.append(("merge", f"unbekanntes Segment {item!r}"))
+    return segments
+
+
+def _segment_frames(segment: tuple, fps: Fraction, source: Source) -> int:
+    if segment[0] == "black":
+        return _media.frame_count(segment[1], fps)
+    return (segment[1] if segment[0] == "file" else source).video_frames
+
+
+def _start_tc(source: Source, code, segments: list[tuple]) -> str:
+    fps, start = source.fps, _media.tc_frames(source.start_tc, source.fps)
+    if code is None:
+        return source.start_tc
+    if code.start is not None:
+        return _media.tc_text(_media.tc_frames(code.start, fps), fps)
+    if code.shift is not None:
+        return _media.tc_text(start + _media.shift_frames(code.shift, fps), fps)
+    before = segments[:next(index for index, segment in enumerate(segments) if segment[0] == "source")]
+    return _media.tc_text(start - sum(_segment_frames(segment, fps, source) for segment in before), fps)
+
+
+def prepare(source: Source, output, progress: _analysis.Progress, segment_cache: dict) -> Plan:
+    """Plan of one output; PrepareError with all problems found."""
+    errors: list[tuple[str, str]] = []
+    try:
+        name, preset = _presets.load(output.preset)
+    except ValueError as exc:
+        raise PrepareError([("preset", str(exc))]) from exc
+    target = Path(output.file)
+    if target.exists():
+        errors.append(("file", f"Zieldatei vorhanden: {target}"))
+    if not source.video or not source.fps:
+        raise PrepareError([*errors, ("source", "Source hat kein lesbares Video")])
+    scan = preset["video"]["scan"]
+    interlaced = source.field_order in ("tff", "bff")
+    field_order = (source.field_order if interlaced else "tff") if scan == "interlaced" else \
+        source.field_order if scan == "source" and interlaced else None
+    changes, results = {}, []
+    replaced = {replaced_fix[change.kind] for change in output.modify}
+    for item in (item for item in output.fixes if item.name not in replaced):
+        values = _analysis.section(item.name, item.settings)
+        step = f"fix:{item.name}"
+        try:
+            found = _analysis.report(source, item.name, values, progress)
+            if item.name == "interlace":
+                change, detail = _analysis.fix_interlace(found, values, scan)
+            elif item.name == "black_bars":
+                change, detail = _analysis.fix_black_bars(found, values, source.width, source.height)
+            else:
+                change, detail = _analysis.fix_audio(found, values, item.target, len(source.channels))
+        except _analysis.FixError as exc:
+            errors.append((step, str(exc)))
+            continue
+        except (OSError, RuntimeError, ValueError) as exc:
+            errors.append((step, f"Analyse nicht möglich: {exc}"))
+            continue
+        changes.update(change)
+        results.append({"name": item.name, "changed": detail is not None, "detail": detail, "trust": found.get("trust")})
+    for change in output.modify:
+        changes[change.kind] = change.value
+    texts = [f"{change.kind} {change.value}" for change in output.modify]
+    crop = changes.get("crop")
+    if crop and (crop[0] < 0 or crop[1] < 0 or crop[2] < 2 or crop[3] < 2 or crop[0] + crop[2] > source.width
+                 or crop[1] + crop[3] > source.height):
+        errors.append(("modify", f"Beschnitt {crop} liegt nicht im Bild {source.width}×{source.height}"))
+    layout = preset["audio"]["layout"]
+    channels = changes.get("audio_map") or ([1, 2] if layout == "stereo" else list(range(1, len(source.channels) + 1)))
+    if not source.channels:
+        errors.append(("audio", "Source hat keinen Ton"))
+    elif bad := [number for number in channels if not 1 <= number <= len(source.channels)]:
+        errors.append(("audio", f"Kanal {', '.join(map(str, bad))} fehlt, Source hat {len(source.channels)} Kanäle"))
+    elif layout == "stereo" and len(channels) != 2:
+        errors.append(("audio", f"Stereo braucht genau 2 Kanäle, erhalten {channels}"))
+    frame = _frame(source, preset, crop)
+    segments = _segments(source, output.merge, frame, preset["video"]["frame"] in ("raster", "source"), errors,
+                         segment_cache)
+    try:
+        start_tc = _start_tc(source, output.timecode, segments) if segments else source.start_tc
+    except ValueError as exc:
+        errors.append(("timecode", str(exc)))
+        start_tc = source.start_tc
+    if errors:
+        raise PrepareError(errors)
+    tracks = [channels] if layout == "stereo" else [[number] for number in channels]
+    rate = preset["audio"].get("sample_rate") or source.sample_rate
+    duration = sum(_segment_frames(segment, source.fps, source) for segment in segments) / float(source.fps)
+    return Plan(output, name, preset, target, frame, field_order, bool(changes.get("deinterlace")) and scan == "progressive",
+                crop, tracks, rate, _bits(source, preset), segments, start_tc, duration, results, texts)
+
+
+# --------- FUNC GRAPH ---------
+class _Graph:
+    """Filter graph text; input pads used more than once are split."""
+    def __init__(self) -> None:
+        self.lines, self.uses, self.count = [], {}, 0
+
+    def label(self) -> str:
+        self.count += 1
+        return f"l{self.count}"
+
+    def use(self, pad: str) -> str:
+        label = self.label()
+        self.uses.setdefault(pad, []).append(label)
+        return f"[{label}]"
+
+    def add(self, inputs: str, filters: str) -> str:
+        label = self.label()
+        self.lines.append(f"{inputs}{filters}[{label}]")
+        return f"[{label}]"
+
+    def text(self) -> str:
+        splits = []
+        for pad, labels in self.uses.items():
+            kind = "asplit" if ":a:" in pad else "split"
+            splits.append(f"[{pad}]{kind}={len(labels)}" + "".join(f"[{label}]" for label in labels))
+        return ";".join(splits + self.lines)
+
+
+def _picture(plan: Plan, width: int, height: int, sar: Fraction, crop, deinterlace: bool) -> list[str]:
+    filters = ["bwdif=mode=send_frame:parity=auto:deint=all"] if deinterlace else []
+    if crop:
+        filters.append(f"crop={crop[2]}:{crop[3]}:{crop[0]}:{crop[1]}")
+        width, height = crop[2], crop[3]
+    frame_width, frame_height, frame_sar = plan.frame
+    size = fit(width, height, sar, plan.frame)
+    if size != (width, height) or sar != frame_sar:
+        color = ":in_color_matrix=auto:out_color_matrix=bt709" if plan.preset["video"].get("color") == "bt709" else ""
+        filters.append(f"scale={size[0]}:{size[1]}:flags=lanczos{':interl=1' if plan.field else ''}{color}")
+    if size != (frame_width, frame_height):
+        filters.append(f"pad={frame_width}:{frame_height}:{(frame_width - size[0]) // 4 * 2}:"
+                       f"{(frame_height - size[1]) // 4 * 2}:color=black")
+    filters += [f"setsar={frame_sar.numerator}/{frame_sar.denominator}"]
+    if pix_fmt := plan.preset["video"].get("pix_fmt"):
+        filters.append(f"format={pix_fmt}")
+    if plan.field:
+        filters.append(f"setfield={plan.field}")
+    return filters
+
+
+def _video(graph: _Graph, plan: Plan, segment: tuple, inputs: dict, source: Source, merged: bool) -> str:
+    fps = source.fps
+    if segment[0] == "black":
+        frame_width, frame_height, frame_sar = plan.frame
+        filters = [f"color=c=black:s={frame_width}x{frame_height}:r={fps.numerator}/{fps.denominator}",
+                   f"trim=end_frame={_media.frame_count(segment[1], fps)}",
+                   *_picture(plan, frame_width, frame_height, frame_sar, None, False)]
+        return graph.add("", ",".join(filters + ["setpts=PTS-STARTPTS"]))
+    owner = segment[1] if segment[0] == "file" else source
+    pad = f"{inputs[(id(owner), owner.video.file)]}:v:{owner.video.ordinal}"
+    crop, deinterlace = (plan.crop, plan.deinterlace) if segment[0] == "source" else (None, False)
+    filters = _picture(plan, owner.width, owner.height, owner.sar, crop, deinterlace)
+    return graph.add(graph.use(pad), ",".join(filters + (["setpts=PTS-STARTPTS"] if merged else [])))
+
+
+def _audio(graph: _Graph, plan: Plan, segment: tuple, inputs: dict, source: Source, merged: bool) -> list[str]:
+    duration = _segment_frames(segment, source.fps, source) / float(source.fps)
+    tail = f",apad,atrim=duration={duration:.6f},asetpts=PTS-STARTPTS" if merged else ""
+    owner = segment[1] if segment[0] == "file" else source if segment[0] == "source" else None
+    labels = []
+    for track_number, track in enumerate(plan.tracks, 1):
+        if owner is source:
+            numbers = track
+        elif owner and owner.channels:
+            count = len(owner.channels)
+            numbers = ([1, 2 if count > 1 else 1] if len(track) == 2 else
+                       [track_number] if track_number <= count else [])
+        else:
+            numbers = []
+        if not numbers:
+            layout = "stereo" if len(track) == 2 else "mono"
+            labels.append(graph.add("", f"anullsrc=r={plan.rate}:cl={layout},atrim=duration={duration:.6f},"
+                                        f"asetpts=PTS-STARTPTS"))
+            continue
+        parts = []
+        for number in numbers:
+            ref = owner.channels[number - 1]
+            pad = f"{inputs[(id(owner), ref.stream.file)]}:a:{ref.stream.ordinal}"
+            parts.append(graph.add(graph.use(pad), f"pan=mono|c0=c{ref.index},aresample={plan.rate}"))
+        joined = parts[0] if len(parts) == 1 else graph.add("".join(parts), "join=inputs=2:channel_layout=stereo")
+        labels.append(graph.add(joined, tail.lstrip(",")) if tail else joined)
+    return labels
+
+
+def _codec_args(plan: Plan) -> list[str]:
+    video, audio = plan.preset["video"], plan.preset["audio"]
+    args = ["-c:v", video["codec"]]
+    if video.get("profile"):
+        args += ["-profile:v", video["profile"]]
+    if video["codec"] == "libx264":
+        args += ["-preset", video.get("x264_preset", "medium")]
+    args += [option for key, name in (("bitrate", "-b:v"), ("maxrate", "-maxrate"), ("bufsize", "-bufsize"))
+             if video.get(key) for option in (name, video[key])]
+    if video.get("color") == "bt709":
+        args += ["-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709"]
+    if plan.field:
+        args += ["-field_order", "tt" if plan.field == "tff" else "bb"]
+    if plan.field and video["codec"] == "dnxhd":
+        args += ["-flags", "+ildct+ilme", "-top", "1" if plan.field == "tff" else "0"]
+    if audio["codec"] == "aac":
+        args += ["-c:a", "aac", "-b:a", audio.get("bitrate", "320k"), "-ar", str(plan.rate)]
+    else:
+        args += ["-c:a", f"pcm_s{plan.bits}le", "-ar", str(plan.rate)]
+    container = plan.preset["container"]
+    args += ["-timecode", plan.start_tc, "-map_metadata", "-1", "-map_chapters", "-1", "-f", container]
+    if container == "mp4":
+        args += ["-write_tmcd", "1", *(["-movflags", "+faststart"] if plan.preset.get("faststart") else [])]
+    return args
+
+
+def build(source: Source, plans: list[Plan]) -> tuple[list[str], str]:
+    """(input and output arguments, filter graph) for all plans in one ffmpeg run."""
+    inputs, args = {}, []
+    owners = [source] + list({id(segment[1]): segment[1] for plan in plans for segment in plan.segments
+                              if segment[0] == "file"}.values())
+    for owner in owners:
+        for number, path in enumerate(owner.files):
+            inputs[(id(owner), number)] = len(inputs)
+            args += ["-i", str(path)]
+    graph, outputs = _Graph(), []
+    for plan in plans:
+        merged = plan.segments != [("source",)]
+        parts = [(_video(graph, plan, segment, inputs, source, merged), _audio(graph, plan, segment, inputs, source, merged))
+                 for segment in plan.segments]
+        if merged:
+            labels = "".join(video + "".join(audio) for video, audio in parts)
+            video_label = graph.label()
+            audio_labels = [graph.label() for _ in plan.tracks]
+            graph.lines.append(f"{labels}concat=n={len(parts)}:v=1:a={len(plan.tracks)}[{video_label}]"
+                               + "".join(f"[{label}]" for label in audio_labels))
+            video_label, audio_labels = f"[{video_label}]", [f"[{label}]" for label in audio_labels]
+        else:
+            video_label, audio_labels = parts[0]
+        outputs += ["-map", video_label, *(option for label in audio_labels for option in ("-map", label)),
+                    *_codec_args(plan), str(plan.part)]
+    return args + ["@graph"] + outputs, graph.text()
+
+
+# --------- FUNC RUN ---------
+def _remove(paths: list[Path]) -> None:
+    for path in paths:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def run(source: Source, plans: list[Plan], on_progress: Callable[[dict], None]) -> dict[int, str]:
+    """Render all plans in one ffmpeg run; RuntimeError on failure (part files removed).
+
+    Returns {index of plan: error} for finished files that could not be moved to their target.
+    """
+    for plan in plans:
+        plan.target.parent.mkdir(parents=True, exist_ok=True)
+    arguments, graph_text = build(source, plans)
+    total = max(plan.duration for plan in plans) or 1.0
+    with tempfile.TemporaryDirectory(prefix="transcoder_") as folder:
+        if len(graph_text) > script_from:
+            script = Path(folder) / "graph.txt"
+            script.write_text(graph_text, encoding="utf-8")
+            graph_args = ["-filter_complex_script", str(script)]
+        else:
+            graph_args = ["-filter_complex", graph_text]
+        index = arguments.index("@graph")
+        command = [_media.tool_path("ffmpeg"), "-hide_banner", "-nostdin", "-y", "-v", "error", "-nostats",
+                   "-progress", "pipe:1", *arguments[:index], *graph_args, *arguments[index + 1:]]
+        for plan in plans:
+            plan.command = command
+        errors_path = Path(folder) / "stderr.txt"
+        with errors_path.open("wb") as errors:
+            process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=errors,
+                                       text=True, encoding="utf-8", errors="replace")
+            try:
+                values, last, started = {}, 0.0, time.monotonic()
+                for line in process.stdout:
+                    name, _, value = line.strip().partition("=")
+                    values[name] = value
+                    if name == "progress" and time.monotonic() - last >= progress_interval:
+                        last = time.monotonic()
+                        position = (_media.number(values.get("out_time_us")) or 0) / 1e6
+                        speed = _media.number(values.get("speed", "").rstrip("x")) or 0
+                        on_progress({"percent": min(100.0, position / total * 100), "media_time": position,
+                                     "fps": _media.number(values.get("fps")) or 0, "speed": speed,
+                                     "eta": (total - position) / speed if speed else None,
+                                     "elapsed": time.monotonic() - started})
+                code = process.wait()
+            except BaseException:
+                process.kill()
+                process.wait()
+                _remove([plan.part for plan in plans])
+                raise
+        if code:
+            _remove([plan.part for plan in plans])
+            raise RuntimeError(_media.tail(errors_path.read_text(encoding="utf-8", errors="replace")))
+    failed = {}
+    for index, plan in enumerate(plans):
+        try:
+            if plan.target.exists():
+                raise FileExistsError(f"Zieldatei inzwischen vorhanden: {plan.target}")
+            os.replace(plan.part, plan.target)
+        except OSError as exc:
+            _remove([plan.part])
+            failed[index] = str(exc)
+    return failed

@@ -1,0 +1,7 @@
+extends = "dnxhr_hqx"
+
+[video]
+profile = "dnxhd"
+bitrate = "185M"
+frame   = "1920x1080"
+scan    = "interlaced"
