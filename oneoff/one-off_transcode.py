@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import traceback
@@ -21,7 +22,7 @@ from transcoder._source import Source
 
 # --------- CONFIG ---------
 app_name = "One-off Transcode"
-app_version = "0.1.0"
+app_version = "0.2.0"
 
 qc_list = "details_qc_2026-10-13_09-30-50-536327.txt"                               # Marathon details_qc_*.txt
 qc_folder = r"\\10.0.77.11\Ablage KI Proxy_1\Proxy 10 Mbit\DEFA\.marathon"          # proxies; searched including subfolders
@@ -32,8 +33,11 @@ wrong_fps, target_fps = 50, 25                                                  
 proxy_preset = "h264_10mbit_1080p"                                                  # encoder values for new video and new audio
 duration_tolerance = 0.5                                                            # seconds the new file may differ from the original
 report_folder = "reports"                                                           # result list; relative to this file
+done_lists = ["one-off_transcode_2026-10-20_19-17-04.txt"]                          # earlier result lists; OK clips are not rendered again
 
-base_path = Path(__file__).resolve().parent
+# Exe: files next to the exe; the exe content is unpacked to sys._MEIPASS.
+base_path = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
+bundle_path = Path(getattr(sys, "_MEIPASS", base_path))
 main_log = base_path / "one-off_transcode.log"
 
 
@@ -76,6 +80,12 @@ def _progress(text: str) -> None:
 
 def _fps_text(value) -> str:
     return f"{float(value):.3f}".rstrip("0").rstrip(".") if value else "?"
+
+
+# --------- FUNC FILES ---------
+def _local(name: str) -> Path:
+    """Relative file next to the exe or script, else inside the exe; absolute paths stay as they are."""
+    return next((path for path in (base_path / name, bundle_path / name) if path.is_file()), base_path / name)
 
 
 # --------- FUNC QC LIST ---------
@@ -125,6 +135,17 @@ def _latest(entries: list[Entry]) -> list[Entry]:
         if key not in chosen or (entry.row("Zeit"), entry.number) >= (chosen[key].row("Zeit"), chosen[key].number):
             chosen[key] = entry
     return sorted(chosen.values(), key=lambda entry: entry.number)
+
+
+def _done_lists() -> list[Path]:
+    """Configured result lists and all result lists in report_folder, so a restart skips them too."""
+    reports = sorted((base_path / report_folder).glob("one-off_transcode_*.txt"))
+    return list(dict.fromkeys([*map(_local, done_lists), *reports]))
+
+
+def _done_names(paths: list[Path]) -> set[str]:
+    """File names with status OK; result lists use the entry layout of the QC list, the title is the file name."""
+    return {entry.title.casefold() for path in paths for entry in _read_qc(path) if entry.status == "OK"}
 
 
 def _value(text: str) -> float | None:
@@ -394,7 +415,8 @@ def _process(entry: Entry, index: dict[str, list[Path]], preset: dict, path: Pat
 
 # --------- FUNC CONFIG ---------
 def _config_problems() -> list[str]:
-    problems = [] if qc_list and Path(qc_list).is_file() else [f"qc_list: QC-Liste {qc_list!r} nicht gefunden"]
+    problems = [] if qc_list and _local(qc_list).is_file() else [f"qc_list: QC-Liste {qc_list!r} nicht gefunden"]
+    problems += [f"done_lists: Ergebnisliste {name!r} nicht gefunden" for name in done_lists if not _local(name).is_file()]
     problems += [] if Path(qc_folder).is_dir() else [f"qc_folder: Ordner {qc_folder!r} nicht gefunden"]
     problems += [] if rules else ["rules ist leer"]
     if unknown := [name for name in rules if name not in rule_functions]:
@@ -417,15 +439,18 @@ def main() -> None:
     mode = "Testlauf, nichts wird geändert" if dry_run else "Dateien werden ersetzt"
     say(f"{version_text} · {mode}")
     preset = _presets.load(proxy_preset)[1]
-    entries = _latest(_read_qc(Path(qc_list)))
-    say(f"{len(entries)} abgelehnte Dateien in der QC-Liste; suche im QC-Ordner …")
+    listed, done_paths = _latest(_read_qc(_local(qc_list))), _done_lists()
+    done = _done_names(done_paths)
+    entries = [entry for entry in listed if entry.name.casefold() not in done]
+    done_text = f"{len(listed) - len(entries)} schon gerechnet laut {', '.join(path.name for path in done_paths)}"
+    say(f"{len(listed)} abgelehnte Dateien in der QC-Liste, davon {done_text}; suche {len(entries)} im QC-Ordner …")
     index = _index(Path(qc_folder), {entry.name.casefold() for entry in entries})
     say(f"{len(index)} davon im QC-Ordner gefunden")
     path = base_path / report_folder / f"one-off_transcode_{started:%Y-%m-%d_%H-%M-%S}.txt"
     title = f"{app_name} · Ergebnisliste"
     _write(path, [title, "=" * len(title), *_rows([("Start", f"{started:%Y-%m-%d %H:%M:%S}"), ("Versionen", version_text),
                                                      ("Modus", mode), ("QC-Liste", qc_list), ("QC-Ordner", qc_folder),
-                                                     ("Regeln", ", ".join(rules))])])
+                                                     ("Regeln", ", ".join(rules)), ("Erledigt", done_text)])])
     counts = Counter()
     for entry in entries:
         _process(entry, index, preset, path, counts)
