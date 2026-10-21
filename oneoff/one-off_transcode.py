@@ -23,15 +23,15 @@ from transcoder._source import Source
 app_name = "One-off Transcode"
 app_version = "0.1.0"
 
-qc_list = r""                               # Marathon details_qc_*.txt
-qc_folder = r"\\10.0.77.11\Ablage KI Proxy_1\Proxy 10 Mbit\.marathon\qc"   # proxies; searched including subfolders
-dry_run = True                              # True: only show what would be done, change nothing
-rules = ["video_bitrate", "fps_50", "audio_stereo"]   # active rules, see USE CASE
-max_video_mbit = 11                         # video_bitrate: above this the video is encoded again
-wrong_fps, target_fps = 50, 25              # fps_50: frame rate found, frame rate of the new file
-proxy_preset = "h264_10mbit_1080p"          # encoder values for new video and new audio
-duration_tolerance = 0.5                    # seconds the new file may differ from the original
-report_folder = "reports"                   # result list; relative to this file
+qc_list = "details_qc_2026-10-13_09-30-50-536327.txt"                               # Marathon details_qc_*.txt
+qc_folder = r"\\10.0.77.11\Ablage KI Proxy_1\Proxy 10 Mbit\DEFA\.marathon"          # proxies; searched including subfolders
+dry_run = False                                                                     # True: only show what would be done, change nothing
+rules = ["video_bitrate", "fps_50", "audio_stereo"]                                 # active rules, see USE CASE
+max_video_mbit = 11                                                                 # video_bitrate: above this the video is encoded again
+wrong_fps, target_fps = 50, 25                                                      # fps_50: frame rate found, frame rate of the new file
+proxy_preset = "h264_10mbit_1080p"                                                  # encoder values for new video and new audio
+duration_tolerance = 0.5                                                            # seconds the new file may differ from the original
+report_folder = "reports"                                                           # result list; relative to this file
 
 base_path = Path(__file__).resolve().parent
 main_log = base_path / "one-off_transcode.log"
