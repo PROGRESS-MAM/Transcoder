@@ -25,7 +25,7 @@ proxy_preset = "h264_10mbit_1080p"
 master_preset = "dnxhr_hqx"                 # new masters from progressive sources
 master_preset_interlaced = "dnxhd_185x"     # new masters from interlaced sources
 ffe_black_seconds = 1                       # black between FFE plate and film
-settings = None                             # settings per check for the analysis and all fixes; None = defaults
+settings = {"samples": {"full": True}, "black_bars": {"extra_crop": 10}}
 
 
 # --------- STATIC ---------
