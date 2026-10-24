@@ -12,7 +12,7 @@ import transcoder
 
 # --------- CONFIG ---------
 app_name = "Transcode Marathon"
-app_version = "0.1.0"
+app_version = "0.1.1"
 
 root_path = Path(r"\\10.0.77.11\Ablage KI Proxy_1\Proxy 10 Mbit")   # like root_path in Marathon's res/config.ini
 work_dir = ".marathon"                      # like work_dir in Marathon's res/config.ini
@@ -25,7 +25,9 @@ proxy_preset = "h264_10mbit_1080p"
 master_preset = "dnxhr_hqx"                 # new masters from progressive sources
 master_preset_interlaced = "dnxhd_185x"     # new masters from interlaced sources
 ffe_black_seconds = 1                       # black between FFE plate and film
-settings = {"samples": {"full": True}, "black_bars": {"extra_crop": 10}}
+settings = {"samples": {"per_minute": 10, "seconds": 2}, "black_bars": {"extra_crop": 10}}
+# Halte per_minute × seconds ≤ 60
+
 
 
 # --------- STATIC ---------
