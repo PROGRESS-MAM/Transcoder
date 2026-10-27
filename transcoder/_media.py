@@ -47,27 +47,36 @@ def tail(text: str) -> str:
     return " | ".join(lines[-error_lines:]) or "ohne Meldung"
 
 
-def run_text(tool: str, args: list[str]) -> tuple[str, str]:
+def run_text(tool: str, args: list[str], timeout: float | None = None) -> tuple[str, str]:
     """Run ffmpeg/ffprobe and return (stdout, stderr); RuntimeError with the last lines on failure."""
-    process = subprocess.run([tool_path(tool), "-hide_banner", *args], stdin=subprocess.DEVNULL,
-                             capture_output=True, text=True, encoding="utf-8", errors="replace")
+    try:
+        process = subprocess.run([tool_path(tool), "-hide_banner", *args], stdin=subprocess.DEVNULL,
+                                 capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"{tool}: Zeitlimit von {timeout:g} Sekunden überschritten.") from exc
     if process.returncode:
         raise RuntimeError(f"{tool}: {tail(process.stderr)}")
     return process.stdout, process.stderr
 
 
-def read_chunks(args: list[str], chunk_size: int) -> Iterator[bytes]:
-    """Run ffmpeg and yield stdout in chunks of chunk_size bytes; the last chunk may be shorter."""
+def read_chunks(args: list[str], chunk_size: int, stderr: list[str] | None = None) -> Iterator[bytes]:
+    """Yield stdout chunks; optional stderr receives the info log after the stream is fully consumed."""
     # stderr goes to a file, a full pipe would block the process.
     with tempfile.TemporaryFile() as errors:
-        process = subprocess.Popen([tool_path("ffmpeg"), "-hide_banner", "-nostdin", "-v", "error", *args],
+        process = subprocess.Popen([tool_path("ffmpeg"), "-hide_banner", "-nostdin",
+                                    "-v", "info" if stderr is not None else "error", *args],
                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=errors)
         try:
             while chunk := process.stdout.read(chunk_size):
                 yield chunk
-            if process.wait():
+            code = process.wait()
+            if code or stderr is not None:
                 errors.seek(0)
-                raise RuntimeError(f"ffmpeg: {tail(errors.read().decode('utf-8', 'replace'))}")
+                text = errors.read().decode("utf-8", "replace")
+                if stderr is not None:
+                    stderr.append(text)
+                if code:
+                    raise RuntimeError(f"ffmpeg: {tail(text)}")
         finally:
             if process.poll() is None:
                 process.kill()

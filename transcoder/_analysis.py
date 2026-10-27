@@ -1,6 +1,6 @@
 """Settings, analysis checks and fix rules of the transcoder."""
 # --------- IMPORTS ---------
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from itertools import combinations, zip_longest
 from statistics import median
 import copy
@@ -35,6 +35,8 @@ idet_pattern = re.compile(r"Multi frame detection:\s*TFF:\s*(\d+)\s*BFF:\s*(\d+)
                           r"\s*Undetermined:\s*(\d+)")
 op_atom_marker = "0d010201.10"  # OP-Atom in the operational pattern UL
 Progress = Callable[[str, float], None]
+FrameLines = tuple[np.ndarray, np.ndarray]
+FieldCounts = tuple[int, int, int, int]
 
 
 class FixError(Exception):
@@ -194,20 +196,15 @@ def _interlaced(tff: int, bff: int, prog: int) -> bool:
     return field > prog and field >= 2 * min(tff, bff)
 
 
-def check_interlace(source: Source, values: dict, progress: Progress) -> dict:
-    if not source.video:
-        raise ValueError("Source hat kein Video.")
+def _rate_interlace(source: Source, values: dict, measurements: Iterable[FieldCounts]) -> dict:
     metadata = source.field_order
     meta_rating = {"progressive": "progressive", None: None}.get(metadata, "interlaced")
     report = {"metadata": metadata, "metadata_rating": meta_rating}
     if values["source"] == "metadata":
         return {**report, "rating": meta_rating or "unclear", "trust": 1.0 if meta_rating else 0.0}
     full = values["samples"]["full"]
-    parts = spans(source.duration, values["samples"])
     totals, votes, voters = [0, 0, 0, 0], 0, 0
-    for number, (start, length) in enumerate(parts, 1):
-        progress(f"interlace: Stichprobe {number}/{len(parts)}", number / len(parts))
-        tff, bff, prog, undetermined = _idet(source, start, length, full)
+    for tff, bff, prog, undetermined in measurements:
         totals = [a + b for a, b in zip(totals, (tff, bff, prog, undetermined))]
         if tff + bff + prog:
             voters += 1
@@ -225,15 +222,32 @@ def check_interlace(source: Source, values: dict, progress: Progress) -> dict:
             "voters": voters, "agrees": meta_rating == rating if meta_rating and rating != "unclear" else None}
 
 
+def check_interlace(source: Source, values: dict, progress: Progress) -> dict:
+    """Rate the scan mode from metadata or sampled idet measurements."""
+    if not source.video:
+        raise ValueError("Source hat kein Video.")
+    if values["source"] == "metadata":
+        return _rate_interlace(source, values, [])
+    parts = spans(source.duration, values["samples"])
+    measurements = []
+    for number, (start, length) in enumerate(parts, 1):
+        progress(f"interlace: Stichprobe {number}/{len(parts)}", number / len(parts))
+        measurements.append(_idet(source, start, length, values["samples"]["full"]))
+    return _rate_interlace(source, values, measurements)
+
 # --------- FUNC BLACK BARS ---------
+def _gray_lines(chunk: bytes, width: int, height: int) -> FrameLines:
+    frame = np.frombuffer(chunk, np.uint8).reshape(height, width)
+    return frame.mean(axis=1, dtype=np.float32), frame.mean(axis=0, dtype=np.float32)
+
+
 def _frames_lines(source: Source, start: float, length: float, full: bool) -> Iterator[tuple[np.ndarray, np.ndarray]]:
     ref, width, height = source.video, source.width, source.height
     args = [*_seek(start, length, full), "-i", str(source.files[ref.file]), "-map", f"0:v:{ref.ordinal}", "-an",
             "-vf", f"fps={bars_full_fps if full else bars_fps},format=gray", "-f", "rawvideo", "pipe:1"]
     for chunk in _media.read_chunks(args, width * height):
         if len(chunk) == width * height:
-            frame = np.frombuffer(chunk, np.uint8).reshape(height, width)
-            yield frame.mean(axis=1, dtype=np.float32), frame.mean(axis=0, dtype=np.float32)
+            yield _gray_lines(chunk, width, height)
 
 
 def _edge(lines: np.ndarray, limit: float) -> int:
@@ -242,15 +256,8 @@ def _edge(lines: np.ndarray, limit: float) -> int:
     return int(above[0]) if above.size else len(lines)
 
 
-def check_black_bars(source: Source, values: dict, progress: Progress) -> dict:
-    if not source.video or not source.width or not source.height:
-        raise ValueError("Source hat kein lesbares Video.")
+def _rate_black_bars(source: Source, values: dict, samples: list[list[FrameLines]]) -> dict:
     full = values["samples"]["full"]
-    parts = spans(source.duration, values["samples"])
-    samples = []
-    for number, (start, length) in enumerate(parts, 1):
-        progress(f"black_bars: Stichprobe {number}/{len(parts)}", number / len(parts))
-        samples.append(list(_frames_lines(source, start, length, full)))
     lines = [line for frames in samples for frame in frames for line in frame]
     if not lines:
         return {"rating": "unclear", "trust": 0.0, "reason": "keine Bilder lesbar"}
@@ -276,9 +283,20 @@ def check_black_bars(source: Source, values: dict, progress: Progress) -> dict:
     # Rule of succession: chance that an unseen sample keeps its picture inside the same area.
     trust = 1.0 if rating == "none" else round((voters + 1) / (voters + 2), 4)
     return {"rating": rating, "trust": trust, "black_level": round(black, 1), "bars": bars, "active": active,
-            "size": (source.width, source.height), "samples": len(parts), "valid_samples": len(sides),
-            "black_samples": len(parts) - len(sides)}
+            "size": (source.width, source.height), "samples": len(samples), "valid_samples": len(sides),
+            "black_samples": len(samples) - len(sides)}
 
+
+def check_black_bars(source: Source, values: dict, progress: Progress) -> dict:
+    """Rate black borders using the unchanged row and column measurements."""
+    if not source.video or not source.width or not source.height:
+        raise ValueError("Source hat kein lesbares Video.")
+    parts = spans(source.duration, values["samples"])
+    samples = []
+    for number, (start, length) in enumerate(parts, 1):
+        progress(f"black_bars: Stichprobe {number}/{len(parts)}", number / len(parts))
+        samples.append(list(_frames_lines(source, start, length, values["samples"]["full"])))
+    return _rate_black_bars(source, values, samples)
 
 # --------- FUNC AUDIO ---------
 def _audio_args(source: Source, number: int, start: float, length: float, full: bool, rate: int) -> list[str]:
@@ -377,6 +395,47 @@ def check_audio(source: Source, values: dict, progress: Progress) -> dict:
     return {"trust": min(channel["trust"] for channel in channels), "rate": rate, "channels": channels,
             "audible": [channel["channel"] for channel in channels if channel["audible"]],
             "pairs": results, "duplicates": [pair["channels"] for pair in results if pair["duplicate"]]}
+
+
+# --------- FUNC SHARED VIDEO ---------
+def _can_combine(source: Source, names: list[str], sections: dict[str, dict]) -> bool:
+    pair = ("black_bars", "interlace")
+    return (all(name in names and key(name, sections[name]) not in source.reports for name in pair)
+            and sections["interlace"]["source"] == "analyse"
+            and sections["black_bars"]["samples"] == sections["interlace"]["samples"])
+
+
+def _video_sample(source: Source, start: float, length: float, full: bool) -> tuple[list[FrameLines], FieldCounts]:
+    ref, width, height = source.video, source.width, source.height
+    # Pin idet precision so gray conversion cannot propagate before split.
+    pixel_format = source.video.data.get("pix_fmt")
+    scan_format = f"format={pixel_format}," if pixel_format else ""
+    graph = (f"[0:v:{ref.ordinal}]split=2[scan_in][bars_in];[scan_in]{scan_format}idet[scan];"
+             f"[bars_in]fps={bars_full_fps if full else bars_fps},format=gray[bars]")
+    args = [*_seek(start, length, full), "-i", str(source.files[ref.file]), "-filter_complex", graph,
+            "-map", "[scan]", "-an", "-f", "null", "-", "-map", "[bars]", "-an", "-f", "rawvideo", "pipe:1"]
+    errors = []
+    frames = [_gray_lines(chunk, width, height) for chunk in _media.read_chunks(args, width * height, errors)
+              if len(chunk) == width * height]
+    found = idet_pattern.findall("\n".join(errors))
+    return frames, tuple(map(int, found[-1])) if found else (0, 0, 0, 0)
+
+
+def _video_reports(source: Source, sections: dict[str, dict], progress: Progress) -> dict[str, dict]:
+    if not source.video or not source.width or not source.height:
+        raise ValueError("Source hat kein lesbares Video.")
+    values = sections["black_bars"]["samples"]
+    parts, samples, measurements = spans(source.duration, values), [], []
+    for number, (start, length) in enumerate(parts, 1):
+        progress(f"black_bars+interlace: Stichprobe {number}/{len(parts)}", number / len(parts))
+        frames, fields = _video_sample(source, start, length, values["full"])
+        samples.append(frames)
+        measurements.append(fields)
+    reports = {"black_bars": _rate_black_bars(source, sections["black_bars"], samples),
+               "interlace": _rate_interlace(source, sections["interlace"], measurements)}
+    for name, found in reports.items():
+        source.reports[key(name, sections[name])] = found
+    return reports
 
 
 runners = {"streams": check_streams, "interlace": check_interlace, "black_bars": check_black_bars, "audio": check_audio}

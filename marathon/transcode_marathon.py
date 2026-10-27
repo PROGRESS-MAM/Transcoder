@@ -1,18 +1,22 @@
 # --------- IMPORTS ---------
+from dataclasses import replace
 from fractions import Fraction
 from pathlib import Path, PureWindowsPath
 import json
 import re
 import sys
+import time
 import traceback
 from toolbox import tb_write_log
 from marathon import marathon_adapter as adapter
 import transcoder
+from transcoder import _analysis, _render
+from transcoder._source import Source
 
 
 # --------- CONFIG ---------
 app_name = "Transcode Marathon"
-app_version = "0.1.1"
+app_version = "0.2.0"
 
 root_path = Path(r"\\10.0.77.11\Ablage KI Proxy_1\Proxy 10 Mbit")   # like root_path in Marathon's res/config.ini
 work_dir = ".marathon"                      # like work_dir in Marathon's res/config.ini
@@ -21,11 +25,12 @@ stage = "Transcode"
 poll_seconds = 30
 heartbeat_seconds = 30
 
-proxy_preset = "h264_10mbit_1080p"
+proxy_preset = "h264_10mbit_1080p_nvenc"
 master_preset = "dnxhr_hqx"                 # new masters from progressive sources
 master_preset_interlaced = "dnxhd_185x"     # new masters from interlaced sources
 ffe_black_seconds = 1                       # black between FFE plate and film
-settings = {"samples": {"per_minute": 10, "seconds": 2}, "black_bars": {"extra_crop": 10}}
+log_progress_seconds = 30
+settings = {"samples": {"per_minute": 5, "seconds": 2}, "black_bars": {"extra_crop": 10}}
 # Halte per_minute × seconds ≤ 60
 
 
@@ -57,6 +62,7 @@ short_patterns = (_short_pattern(_parts(root_path), work_dir), _short_pattern(_p
 
 
 # --------- INIT ---------
+_last_progress = 0.0
 _plates: dict[tuple[str, int, float], tuple | None] = {}    # (path, size, mtime) of an FFE plate: its format
 
 
@@ -69,10 +75,18 @@ def _short(text) -> str:
 
 
 def _console(message) -> None:
-    if message.kind == "progress":
-        adapter.status(_short(message.text))
-    else:
-        adapter.log(_short(message.text))
+    global _last_progress
+    text = _short(message.text)
+    if message.kind != "progress":
+        adapter.log(text)
+        return
+    adapter.status(text)
+    if "speed" not in message.data:
+        return
+    now = time.monotonic()
+    if not _last_progress or now - _last_progress >= log_progress_seconds or message.data.get("percent", 0) >= 100:
+        adapter.log(text)
+        _last_progress = now
 
 
 def _size_text(path: Path) -> str:
@@ -203,7 +217,28 @@ def _master_reasons(reports: dict, ffe: bool) -> list[str]:
     return [text for hit, text in found if hit]
 
 
+def _audio_problem(source: Source, found: dict, master: bool = False) -> str | None:
+    item = _fix("audio", **({"min_audible": 2} if master else {"channels": 2}))
+    values = _analysis.section("audio", item.settings)
+    try:
+        _analysis.fix_audio(found, values, item.target, len(source.channels))
+    except _analysis.FixError as exc:
+        return f"{'Master' if master else 'Proxy'} fix:audio: {exc}"
+    return None
+
+
+def _render_source(source: Source, found: dict) -> Source:
+    if not source.video or found.get("rating") not in ("progressive", "interlaced"):
+        return source
+    _analysis._sure(found, _analysis.split_settings(settings)["interlace"]["trust"], "Interlacing")
+    order = "progressive" if found["rating"] == "progressive" else {"tff": "tt", "bff": "bb"}[found["field_order"]]
+    video = replace(source.video, data={**source.video.data, "field_order": order})
+    return replace(source, video=video)
+
+
 def run_job(job: dict, output_folder: Path, log_path: Path) -> adapter.JobReport:
+    global _last_progress
+    _last_progress = 0.0
     if problem := _job_problem(job):
         return adapter.JobReport("failed", f"Job ungültig: {problem}", _name(proxy_preset))
     ffe, files = job["ffe_tafel"], [adapter.share_path(item) for item in job["inputs"]]
@@ -214,10 +249,11 @@ def run_job(job: dict, output_folder: Path, log_path: Path) -> adapter.JobReport
         source = transcoder.source(files)
     except (OSError, RuntimeError, ValueError) as exc:
         return adapter.JobReport("failed", f"Source nicht lesbar: {exc}", _name(proxy_preset))
-    reports = transcoder.analyse(source, checks, settings, _console)
+    reports = transcoder.analyse(source, "streams", settings, _console)
     if problems := [f"Analyse {name}: {report['error']}" for name, report in reports.items() if "error" in report]:
         return _manual(problems, _name(proxy_preset))
-    adapter.log(_analysis_text(reports))
+    if not source.channels:
+        return _manual(["Analyse audio: Source hat keinen Ton."], _name(proxy_preset))
     merge, code = [], None
     if ffe:
         plate = _plate(job["ffe_reference_clips"], _format(reports["streams"]))
@@ -225,6 +261,21 @@ def run_job(job: dict, output_folder: Path, log_path: Path) -> adapter.JobReport
             return _manual([plate], _name(proxy_preset))
         adapter.log(f"FFE-Tafel: {_short(plate)}")
         merge, code = [plate, transcoder.black(ffe_black_seconds), transcoder.SOURCE], transcoder.timecode(anchor=transcoder.SOURCE)
+    reports.update(transcoder.analyse(source, "audio", settings, _console))
+    if "error" in reports["audio"]:
+        return _manual([f"Analyse audio: {reports['audio']['error']}"], _name(proxy_preset))
+    if problem := _audio_problem(source, reports["audio"]):
+        return _manual([problem], _name(proxy_preset))
+    if problem := _audio_problem(source, reports["audio"], master=True):
+        return _manual([problem], _name(proxy_preset))
+    reports.update(transcoder.analyse(source, checks[2:], settings, _console))
+    if problems := [f"Analyse {name}: {report['error']}" for name, report in reports.items() if "error" in report]:
+        return _manual(problems, _name(proxy_preset))
+    adapter.log(_analysis_text(reports))
+    try:
+        source = _render_source(source, reports["interlace"])
+    except _analysis.FixError as exc:
+        return _manual([str(exc)], _name(proxy_preset))
     proxy_fixes = [_fix("audio", channels=2), _fix("black_bars"), _fix("interlace")]
     items = [transcoder.output(proxy_preset, output_folder / job["proxy_name"], proxy_fixes, merge=merge, timecode=code)]
     preset, reasons, scan = _name(proxy_preset), _master_reasons(reports, ffe), reports["interlace"]["rating"]
@@ -249,6 +300,10 @@ def run_job(job: dict, output_folder: Path, log_path: Path) -> adapter.JobReport
 
 # --------- MAIN ---------
 def main() -> None:
+    if (isinstance(log_progress_seconds, bool) or not isinstance(log_progress_seconds, (int, float))
+            or log_progress_seconds <= 0):
+        raise ValueError("log_progress_seconds muss eine Zahl größer 0 sein.")
+    _render.check_encoder(proxy_preset)
     versions = {"transcode_marathon": app_version, "marathon_adapter": adapter.app_version, **transcoder.versions()}
     worker = adapter.Settings(root_path, work_dir, stage, poll_seconds, heartbeat_seconds, main_log, versions)
     adapter.run(worker, run_job)

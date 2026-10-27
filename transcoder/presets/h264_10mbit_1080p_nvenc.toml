@@ -1,0 +1,7 @@
+extends = "h264_10mbit_1080p"
+
+[video]
+codec        = "h264_nvenc"
+nvenc_preset = "p5"
+nvenc_tune   = "hq"
+nvenc_rc     = "vbr"

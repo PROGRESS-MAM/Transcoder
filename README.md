@@ -1,5 +1,7 @@
 # Transcoder
 
+> **Version 0.2.0:** Vor dem ersten Einsatz des NVIDIA-Proxys ffmpeg, GPU und Treiber mit den Befehlen unter „NVIDIA-Proxy“ prüfen. Für den EXE-Betrieb nach Änderungen einen neuen Windows-Build erstellen.
+
 Rendert Mediendateien mit ffmpeg und analysiert sie. Ganz unten stehen zwei Betriebsarten:
 
 ```
@@ -21,7 +23,7 @@ Der Kern `transcoder` macht genau das. Die minimale App `sample.py` sucht Source
 
 ## Installation
 
-Python 3.11+, ffmpeg ≥ 6 mit libx264 und DNxHD/DNxHR (`ffmpeg` und `ffprobe` in `res/` oder im Systempfad). Einmal je Rechner die Paketquelle der Flow-API eintragen (für `toolbox`):
+Python 3.11+, ffmpeg ≥ 6 mit libx264 und DNxHD/DNxHR (`ffmpeg` und `ffprobe` in `res/` oder im Systempfad). Für das NVIDIA-Proxy-Preset zusätzlich `h264_nvenc` im ffmpeg-Build und einen zum Build passenden NVIDIA-Treiber verwenden; siehe „NVIDIA-Proxy“. Einmal je Rechner die Paketquelle der Flow-API eintragen (für `toolbox`):
 
 ```
 pip config set global.extra-index-url https://artifacts.editshare.com/artifactory/api/pypi/editshare-pypi-public/simple
@@ -105,7 +107,7 @@ Ein einzelner Output: `transcoder.render(src, web)`. Der Kern sucht keine Dateie
 | `modify`, `segments`, `timecode` | angewendete Änderungen, Segmente, Start-TC der Ausgabe |
 | `command`, `seconds` | ffmpeg-Aufruf, Dauer |
 
-Jeder Output wird einzeln betrachtet: Ein Output mit Fehler (z. B. Fix nicht sicher genug, Segment passt nicht) wird nicht gerendert; die anderen laufen weiter. Scheitert ffmpeg im gemeinsamen Durchlauf, rendert der Kern die betroffenen Outputs einzeln nach, damit jeder sein eigenes Ergebnis bekommt. Gerendert wird unter `<Datei>.part`, nach Erfolg umbenannt; bei Fehler oder Abbruch (`Strg+C` beendet ffmpeg) werden die Teildateien gelöscht. Zielordner werden angelegt, vorhandene Dateien nie überschrieben (`error`). Die fertigen Dateien prüft der Kern nicht.
+Jeder Output wird einzeln betrachtet: Ein Output mit Fehler (z. B. Fix nicht sicher genug, Segment passt nicht) wird nicht gerendert; die anderen laufen weiter. Scheitert ffmpeg im gemeinsamen Durchlauf, rendert der Kern die betroffenen Outputs einzeln nach, sofern der Fehler nicht als dauerhaft erkannt wurde. Bei erkannten ungültigen Encoderoptionen oder einer ffmpeg-Assertion gibt es keinen internen Einzeloutput-Wiederholungsversuch. Gerendert wird unter `<Datei>.part`, nach Erfolg umbenannt; bei Fehler oder Abbruch (`Strg+C` beendet ffmpeg) werden die Teildateien gelöscht. Zielordner werden angelegt, vorhandene Dateien nie überschrieben (`error`). Die fertigen Dateien prüft der Kern nicht.
 
 ### Meldungen `on_message(message)`
 
@@ -211,6 +213,7 @@ Ein Preset beschreibt nur das Ausgabeformat. Datei `transcoder/presets/<name>.to
 | Preset | Format | Bildrahmen |
 |---|---|---|
 | `h264_10mbit_1080p` | MP4, H.264 High, 8 bit 4:2:0, BT.709, 10 Mbit/s, quadratische Pixel, progressiv, fps der Source; AAC 320 kbit/s Stereo 48 kHz | 1920×1080 |
+| `h264_10mbit_1080p_nvenc` | wie `h264_10mbit_1080p`, H.264-Encoding mit NVIDIA NVENC statt libx264; p5, HQ, VBR | 1920×1080 |
 | `dnxhr_hqx` | MOV, DNxHR HQX, fps und Scan-Art der Source; PCM in Samplerate und Bittiefe der Source (mind. 16 bit), je Kanal eine Spur | Raster: 1920×1080, 3840×2160, 2048×1080, 1998×1080, 2048×858, 4096×2160, 3996×2160, 4096×1716 |
 | `dnxhd_185x` | MOV, DNxHD 185x interlaced (Feldreihenfolge der Source), 25 fps; PCM wie oben | 1920×1080 |
 
@@ -245,10 +248,13 @@ layout      = "stereo"
 |---|---|
 | `extends` | Name eines anderen Presets als Grundlage |
 | `container`, `faststart` | Container (`mp4`, `mov`); `faststart` nur bei MP4 |
-| `video.codec` | `libx264`, `dnxhd` |
+| `video.codec` | `libx264`, `h264_nvenc`, `dnxhd` |
 | `video.profile` | H.264-Profil bzw. DNx-Profil (`dnxhr_hqx`, `dnxhd`) |
 | `video.bitrate`, `maxrate`, `bufsize` | Bitrate und Regelung (H.264; bei DNxHD 185x die Profilbitrate `185M`) |
 | `video.x264_preset` | Geschwindigkeit/Qualität von x264 |
+| `video.nvenc_preset` | NVENC-Preset `p1` bis `p7`, Standard `p5`; gilt nur für `h264_nvenc` |
+| `video.nvenc_tune` | NVENC-Tuning, für den Proxy `hq`; gilt nur für `h264_nvenc` |
+| `video.nvenc_rc` | Bitratensteuerung, für den Proxy `vbr`; gilt nur für `h264_nvenc` |
 | `video.pix_fmt`, `video.color` | Pixelformat, Farbraum |
 | `video.frame` | Bildrahmen: `"<B>x<H>"`, `"raster"` oder `"source"` (Bild der Source) |
 | `video.rasters` | bei `frame = "raster"`: erlaubte Raster, z. B. `["1920x1080", "2048x1080", "3840x2160", "4096x2160"]` |
@@ -344,6 +350,48 @@ source_settings = {
 
 In der Konsole beginnt jede Zeile mit der Uhrzeit; beim Rendern steht darunter eine Fortschrittszeile (Prozent, Medienzeit, fps, Tempo, Restzeit), die die nächste Zeile ersetzt. Am Ende folgt eine Zusammenfassung mit den Pfaden von Analysebericht und Fehlerliste. Ungültige Einstellungen meldet die App vor dem Start und beendet sich. Ein Output mit `error` hält die übrigen nicht auf. Beenden mit `Strg+C`: ffmpeg wird beendet, Teildateien werden gelöscht.
 
+## NVIDIA-Proxy
+
+DNxHD 185x und DNxHR werden per CPU decodiert. Analyse, Audioverarbeitung, Beschnitt, Skalierung und Deinterlacing bleiben auf der CPU. Nur das H.264-Encoding des Proxys verwendet NVENC; neue DNx-Master werden weiterhin per CPU encodiert. Für DNx-Quellen kein `-hwaccel cuda` einschalten.
+
+### ffmpeg und Treiber prüfen
+
+Im Projektordner mit dem tatsächlich verwendeten ffmpeg prüfen; hier für die Installation in `res/` unter Windows:
+
+```powershell
+.\res\ffmpeg.exe -hide_banner -encoders
+.\res\ffmpeg.exe -hide_banner -h encoder=h264_nvenc
+.\res\ffmpeg.exe -hide_banner -f lavfi -i color=c=black:s=1920x1080:r=25 -frames:v 1 -an -c:v h264_nvenc -preset p5 -tune hq -rc vbr -b:v 10M -maxrate 10.5M -bufsize 20M -f null -
+```
+
+Die Encoderliste muss `h264_nvenc` enthalten. Erst der letzte Befehl prüft zusätzlich, ob der Encoder mit GPU und Treiber startet; er schreibt keine Mediendatei. Bei einer anderen ffmpeg-Installation deren ausführbare Datei verwenden, nicht versehentlich einen anderen Build aus dem Systempfad.
+
+### Preset auswählen
+
+Preset `transcoder/presets/h264_10mbit_1080p_nvenc.toml`:
+
+```toml
+extends = "h264_10mbit_1080p"
+
+[video]
+codec        = "h264_nvenc"
+nvenc_preset = "p5"
+nvenc_tune   = "hq"
+nvenc_rc     = "vbr"
+```
+
+`extends` übernimmt Container, H.264 High, Pixelformat, BT.709, Bildgröße, Bildrate, AAC-Stereo, Faststart und Bitratenvorgaben des CPU-Presets. `nvenc_preset`, `nvenc_tune` und `nvenc_rc` entsprechen den ffmpeg-Optionen `-preset`, `-tune` und `-rc`. Das geerbte `x264_preset` gilt nur für libx264 und wird mit NVENC nicht verwendet.
+
+Im Marathon-Adapter `proxy_preset = "h264_10mbit_1080p_nvenc"` wählen. Für expliziten CPU-Betrieb `proxy_preset = "h264_10mbit_1080p"` setzen. Bei einer EXE gelten Änderungen erst nach einem neuen Build. Für andere Aufrufer bleibt das Preset frei wählbar; ihre bisherigen Presets ändern sich nicht.
+
+Ist NVENC ausgewählt, prüft der Worker den Encoder vor der Jobübernahme. Bei fehlendem Encoder oder nicht nutzbarer GPU/Treiber-Kombination bricht er mit einer konkreten Fehlermeldung ab. Es gibt keinen automatischen Wechsel auf CPU-Encoding.
+
+### Lokal vergleichen
+
+Repräsentative DNx-Clips einschließlich zugehöriger Audiotracks lokal bereitstellen. CPU- und NVENC-Preset mit denselben Quellen, Fixes und Ausgabebedingungen vergleichen; für den Speichereinfluss zusätzlich dieselben Quellen von der Freigabe verwenden. Nur in einer lokalen Testumgebung arbeiten, nicht mit produktiven Marathon-Jobs. Laufzeit, fps, speed, Audio/Timecode und Bildqualität insbesondere bei Filmkorn prüfen. Identische Bitratenvorgaben bedeuten keine identische Bildqualität.
+
+Quellen zur Hardware-Unterstützung: NVIDIA Video Codec SDK 13.0, „Using FFmpeg with NVIDIA GPU Hardware Acceleration“, Abschnitt 3, und „NVDEC Video Decoder API Programming Guide“, Abschnitt 1.1.
+
 ## Marathon-Adapter
 
 Angeflanschte Fernsteuerung für den Marathon-Use-Case: Der Adapter holt Transcode-Jobs aus dem Marathon-Pool, übersetzt sie in Aufrufe des Kerns (`source`, `analyse`, `output`, `render`) und die Ergebnisse in Reports an Marathon. Er nutzt den Kern wie jeder andere Aufrufer und ändert nichts an dessen Funktionslogik, an den Presets oder an der App; seine Use-Case-Logik steht nur in `transcode_marathon.py`.
@@ -371,7 +419,7 @@ Als EXE: `transcode_marathon_<version>.exe` auf den Rechner kopieren und starten
 - Der Worker heißt `<Rechnername>-Transcode`. Je Rechner läuft ein Transcode-Worker; ein zweiter Start auf demselben Rechner bricht ab.
 - Er bearbeitet einen Job nach dem anderen. Ohne Jobs schaut er alle `poll_seconds` erneut in den Pool.
 - Beenden mit `Strg+C`. ffmpeg wird beendet, Teildateien werden gelöscht; der Job wird beim nächsten Start als `failed` gemeldet, Marathon legt ihn neu aus.
-- Log `transcode_marathon.log` neben der EXE bzw. in `marathon/`; enthält alle Konsolenzeilen außer der Fortschrittszeile.
+- Log `transcode_marathon.log` neben der EXE bzw. in `marathon/`; enthält Meldungen, verwendeten Encoder, Zeiten je Analyseschritt und Renderdurchlauf sowie Fortschrittswerte (`fps`, `speed`, Position, ETA) im Abstand von `log_progress_seconds`. Laufzeiten werden unabhängig von Änderungen der Systemuhr gemessen.
 - Pfade werden in Konsole und Log gekürzt: ab `.marathon` (`.marathon\transcode\…`) bzw. ab `++ Master repariert\…`. Report und Protokolle enthalten vollständige Pfade.
 
 ### Use-Case-Logik
@@ -386,6 +434,16 @@ Je Job: Source aus `inputs`, Analyse (`streams`, `audio`, `black_bars`, `interla
 - Ist ein neuer Master nötig und das Interlacing unklar, endet der Job ohne Rendern mit `rejected`.
 - FFE-Tafel bei `"ffe_tafel": true`: Der Adapter wählt aus `ffe_reference_clips` die eine Tafel mit Bildgröße und fps der Source (keine oder mehrere → `rejected`). Proxy und Master bekommen `merge = [<Tafel>, black(ffe_black_seconds), SOURCE]` und `timecode(anchor=SOURCE)`: Tafel (9 s) plus 1 s Schwarz = 10 s vor dem Film, der Film beginnt beim alten Start-TC.
 - Scheitert ein Output des Jobs, löscht der Adapter die übrigen Mediendateien des Jobs (ihre `.render.json` bleiben); Marathon bekommt nur vollständige Ergebnisse.
+
+### Verarbeitung und Fehler
+
+- Nach dem Lesen der Streams zuerst fehlenden Ton und bei FFE-Jobs die passende Tafel prüfen. Nach der Audioanalyse die benötigten Audiobelegungen prüfen. Steht eine Ablehnung bereits fest, keine Rand- oder Interlaceanalyse mehr starten.
+- Bei identischen Stichprobeneinstellungen Ränder und Interlace gemeinsam aus einmal decodierten Stichproben bestimmen. Individuelle Einstellungen je Prüfung und `samples.full` bleiben nutzbar. Die Auswertung und QC-Schwellen bleiben unverändert.
+- Bei erfolgreichem Rendern Proxy und ggf. Master weiterhin in einem gemeinsamen ffmpeg-Durchlauf erzeugen; die Quelle nur einmal einlesen.
+- Den Scanmodus des Marathon-Masters an der eindeutigen Interlaceanalyse ausrichten: progressive Ausgabe mit DNxHR HQX, interlaced Ausgabe mit DNxHD 185x und der ermittelten Feldreihenfolge. Veraltete `-top`-Encoderoptionen nicht verwenden.
+- Bei erkannten ungültigen Encoderoptionen oder einer ffmpeg-Assertion kein erneutes internes Rendern der Einzeloutputs versuchen. Fehler ausdrücklich protokollieren. Nicht als dauerhaft erkannte Fehler können weiterhin in Einzeloutputs eingegrenzt werden.
+- Die Vollständigkeitsregel bleibt bestehen: Nur ein vollständiger Job ist erfolgreich; bei einem fehlgeschlagenen Output werden die anderen Mediendateien weiterhin entfernt. Externe Wiederholungen entscheidet Marathon, nicht der Transcoder.
+- ffmpeg-Assertions werden nicht als behoben vorausgesetzt. Für einen konkreten Absturz einen lokal reproduzierenden Quellclip, den verwendeten Build und das Renderprotokoll bereitstellen; einen anderen Build erst nach lokalem Vergleich einsetzen.
 
 ### EXE bauen
 
@@ -406,11 +464,14 @@ Voraussetzung: `ffmpeg` und `ffprobe` liegen in `res/`, sonst bricht der Build a
 | `stage` | `Transcode` | Stufe |
 | `poll_seconds` | `30` | Wartezeit, wenn der Pool leer ist |
 | `heartbeat_seconds` | `30` | Abstand der Lebenszeichen an Marathon, 1 bis 60 |
-| `proxy_preset` | `h264_10mbit_1080p` | Preset des Proxys |
+| `proxy_preset` | `h264_10mbit_1080p_nvenc` | NVIDIA-Proxy; `h264_10mbit_1080p` für expliziten CPU-Betrieb |
 | `master_preset` | `dnxhr_hqx` | Preset neuer Master aus progressiven Quellen (`frame = "raster"`: FHD, UHD, 2K, 4K) |
 | `master_preset_interlaced` | `dnxhd_185x` | Preset neuer Master aus interlaced Quellen |
 | `ffe_black_seconds` | `1` | Schwarz zwischen Tafel und Film |
-| `settings` | `None` | Einstellungen je Prüfung (siehe „Einstellungen“); `None` = Standardwerte |
+| `settings` | `{"samples": {"per_minute": 5, "seconds": 2}, "black_bars": {"extra_crop": 10}}` | Marathon-Vorgaben: 5 Stichproben pro Minute à 2 Sekunden, zusätzlicher Beschnitt 10 Pixel; QC-Schwellen unverändert |
+| `log_progress_seconds` | `30` | Abstand der Fortschrittswerte im Log; laufende Konsolenanzeige bleibt erhalten |
+
+Die Halbierung betrifft nur die Marathon-Vorgabe `settings.samples.per_minute`: 5 statt 10. `seconds = 2`, `full = false`, Vertrauensschwellen, Audio-Grenzwerte und `black_bars.extra_crop = 10` bleiben unverändert. Die Standardwerte des Kerns und anderer Apps werden nicht halbiert. Bei kurzen Clips können weniger Stichproben häufiger zu einer unsicheren Bewertung führen; die QC-Schwellen werden dafür nicht abgesenkt. Es werden keine Quellen automatisch auf lokale Laufwerke kopiert.
 
 ### Ergebnis eines Jobs
 

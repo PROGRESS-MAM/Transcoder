@@ -253,8 +253,10 @@ class _Graph:
         return ";".join(splits + self.lines)
 
 
-def _picture(plan: Plan, width: int, height: int, sar: Fraction, crop, deinterlace: bool) -> list[str]:
-    filters = ["bwdif=mode=send_frame:parity=auto:deint=all"] if deinterlace else []
+def _picture(plan: Plan, width: int, height: int, sar: Fraction, crop, deinterlace: bool,
+             source_field: str | None = None) -> list[str]:
+    parity = source_field if source_field in ("tff", "bff") else "auto"
+    filters = [f"bwdif=mode=send_frame:parity={parity}:deint=all"] if deinterlace else []
     if crop:
         filters.append(f"crop={crop[2]}:{crop[3]}:{crop[0]}:{crop[1]}")
         width, height = crop[2], crop[3]
@@ -269,8 +271,7 @@ def _picture(plan: Plan, width: int, height: int, sar: Fraction, crop, deinterla
     filters += [f"setsar={frame_sar.numerator}/{frame_sar.denominator}"]
     if pix_fmt := plan.preset["video"].get("pix_fmt"):
         filters.append(f"format={pix_fmt}")
-    if plan.field:
-        filters.append(f"setfield={plan.field}")
+    filters.append(f"setfield={plan.field or 'prog'}")
     return filters
 
 
@@ -285,7 +286,7 @@ def _video(graph: _Graph, plan: Plan, segment: tuple, inputs: dict, source: Sour
     owner = segment[1] if segment[0] == "file" else source
     pad = f"{inputs[(id(owner), owner.video.file)]}:v:{owner.video.ordinal}"
     crop, deinterlace = (plan.crop, plan.deinterlace) if segment[0] == "source" else (None, False)
-    filters = _picture(plan, owner.width, owner.height, owner.sar, crop, deinterlace)
+    filters = _picture(plan, owner.width, owner.height, owner.sar, crop, deinterlace, owner.field_order)
     return graph.add(graph.use(pad), ",".join(filters + (["setpts=PTS-STARTPTS"] if merged else [])))
 
 
@@ -318,21 +319,28 @@ def _audio(graph: _Graph, plan: Plan, segment: tuple, inputs: dict, source: Sour
     return labels
 
 
-def _codec_args(plan: Plan) -> list[str]:
-    video, audio = plan.preset["video"], plan.preset["audio"]
+def _video_codec_args(video: dict, field_order: str | None = None) -> list[str]:
     args = ["-c:v", video["codec"]]
     if video.get("profile"):
         args += ["-profile:v", video["profile"]]
     if video["codec"] == "libx264":
         args += ["-preset", video.get("x264_preset", "medium")]
+    if video["codec"] == "h264_nvenc":
+        args += ["-preset", video.get("nvenc_preset", "p5"), "-tune", video.get("nvenc_tune", "hq"),
+                 "-rc", video.get("nvenc_rc", "vbr")]
     args += [option for key, name in (("bitrate", "-b:v"), ("maxrate", "-maxrate"), ("bufsize", "-bufsize"))
              if video.get(key) for option in (name, video[key])]
     if video.get("color") == "bt709":
         args += ["-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709"]
-    if plan.field:
-        args += ["-field_order", "tt" if plan.field == "tff" else "bb"]
-    if plan.field and video["codec"] == "dnxhd":
-        args += ["-flags", "+ildct+ilme", "-top", "1" if plan.field == "tff" else "0"]
+    args += ["-field_order", {"tff": "tt", "bff": "bb"}.get(field_order, "progressive")]
+    if field_order and video["codec"] == "dnxhd":
+        args += ["-flags", "+ildct+ilme"]
+    return args
+
+
+def _codec_args(plan: Plan) -> list[str]:
+    audio = plan.preset["audio"]
+    args = _video_codec_args(plan.preset["video"], plan.field)
     if audio["codec"] == "aac":
         args += ["-c:a", "aac", "-b:a", audio.get("bitrate", "320k"), "-ar", str(plan.rate)]
     else:
@@ -343,6 +351,34 @@ def _codec_args(plan: Plan) -> list[str]:
         args += ["-write_tmcd", "1", *(["-movflags", "+faststart"] if plan.preset.get("faststart") else [])]
     return args
 
+
+def check_encoder(preset: str | Path) -> None:
+    """Validate a preset; for NVENC encode one generated frame without writing media files.
+
+    Uses the same ffmpeg and video options as rendering. Raises RuntimeError or OSError if NVENC cannot start.
+    CPU presets only undergo preset validation. The NVENC probe has a 30-second time limit.
+    """
+    _, values = _presets.load(preset)
+    video = values["video"]
+    if video["codec"] != "h264_nvenc":
+        return
+    args = ["-nostdin", "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=1920x1080:r=25",
+            "-frames:v", "1", "-an", "-pix_fmt", video.get("pix_fmt", "yuv420p"),
+            *_video_codec_args(video), "-f", "null", "-"]
+    try:
+        _media.run_text("ffmpeg", args, timeout=30)
+    except (OSError, RuntimeError) as exc:
+        raise RuntimeError(f"NVENC nicht nutzbar. Prüfe NVIDIA-Treiber und den verwendeten ffmpeg-Build; "
+                           f"für CPU-Betrieb das libx264-Preset wählen. {exc}") from exc
+
+
+def _permanent_error(message: str) -> bool:
+    text = message.casefold()
+    return ("assertion" in text and "failed" in text) or any(marker in text for marker in (
+        "not a encoding option", "not an encoding option", "unrecognized option", "unknown encoder",
+        "error setting option", "error parsing options", "unable to parse option value",
+        "no nvenc capable devices found", "cannot load nvcuda", "cannot load libcuda", "cannot load nvencodeapi",
+        "driver does not support the required nvenc", "minimum required nvidia driver"))
 
 def build(source: Source, plans: list[Plan]) -> tuple[list[str], str]:
     """(input and output arguments, filter graph) for all plans in one ffmpeg run."""
@@ -425,6 +461,8 @@ def run(source: Source, plans: list[Plan], on_progress: Callable[[dict], None]) 
                 process.wait()
                 _remove([plan.part for plan in plans])
                 raise
+            finally:
+                process.stdout.close()
         if code:
             _remove([plan.part for plan in plans])
             raise RuntimeError(_media.tail(errors_path.read_text(encoding="utf-8", errors="replace")))

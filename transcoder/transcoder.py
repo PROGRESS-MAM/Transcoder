@@ -10,7 +10,7 @@ from ._source import Source, open_source
 
 # --------- CONFIG ---------
 app_name = "Transcoder"
-app_version = "0.1.0"
+app_version = "0.2.0"
 
 
 # --------- TYPES ---------
@@ -124,15 +124,30 @@ def analyse(source: Source, checks: str | Iterable[str], settings: dict | None =
     if unknown := [name for name in names if name not in _analysis.checks]:
         raise ValueError(f"Unbekannte Prüfung {', '.join(unknown)}; erlaubt: {', '.join(_analysis.checks)}.")
     send, reports = _sender(on_message), {}
+    combine = _analysis._can_combine(source, names, sections)
+    done = set()
     for name in names:
-        send("info", f"{source.name()} | Analyse {name} …")
+        if name in done:
+            continue
+        group = [item for item in dict.fromkeys(names) if item in ("black_bars", "interlace")] \
+            if combine and name in ("black_bars", "interlace") else [name]
+        label, started = "+".join(group), time.monotonic()
+        send("info", f"{source.name()} | Analyse {label} …")
+        progress = lambda text, share: send("progress", text, {"percent": share * 100})
         try:
-            reports[name] = _analysis.report(source, name, sections[name],
-                                             lambda text, share: send("progress", text, {"percent": share * 100}))
+            if len(group) == 2:
+                reports.update(_analysis._video_reports(source, sections, progress))
+            else:
+                reports[name] = _analysis.report(source, name, sections[name], progress)
         except (OSError, RuntimeError, ValueError) as exc:
-            reports[name] = {"error": str(exc)}
-            send("warning", f"{source.name()} | Analyse {name} nicht möglich: {exc}")
-    return reports
+            for item in group:
+                reports[item] = {"error": str(exc)}
+            send("warning", f"{source.name()} | Analyse {label} nicht möglich: {exc}")
+        elapsed = time.monotonic() - started
+        send("info", f"{source.name()} | Analyse {label} fertig in {_media.clock(elapsed)}",
+             {"checks": group, "elapsed": elapsed})
+        done.update(group)
+    return {name: reports[name] for name in names}
 
 
 # --------- FUNC OUTPUT ---------
@@ -248,7 +263,7 @@ def render(source: Source, outputs, on_message: OnMessage = None) -> list[_Resul
     """Render the source into one output or a list of outputs in one run; the source is read once.
 
     Returns one result per output in the same order. Each output stands alone: an output with an error is not
-    rendered, the others go on; if ffmpeg fails in the joint run, the outputs are rendered one by one.
+    rendered, the others go on; joint failures retry individually unless recognized as permanent.
     Ctrl+C stops ffmpeg, removes part files and raises KeyboardInterrupt.
     """
     items = [outputs] if isinstance(outputs, _Output) else list(outputs)
@@ -268,21 +283,27 @@ def render(source: Source, outputs, on_message: OnMessage = None) -> list[_Resul
     while groups:
         group = groups.pop(0)
         names = ", ".join(plans[index].target.name for index in group)
-        send("info", f"{source.name()} | Rendern: {names}")
+        encoders = ", ".join(plans[index].preset["video"]["codec"] for index in group)
+        send("info", f"{source.name()} | Rendern: {names} | Encoder: {encoders}")
         group_start = time.monotonic()
         try:
             failed = _render_plans(source, [plans[index] for index in group], send)
         except RuntimeError as exc:
-            if len(group) > 1:
+            elapsed = time.monotonic() - group_start
+            send("warning", f"{source.name()} | Durchlauf gescheitert in {_media.clock(elapsed)} | "
+                            f"Encoder: {encoders}", {"elapsed": elapsed, "encoders": encoders})
+            if len(group) > 1 and not _render._permanent_error(str(exc)):
                 send("warning", f"{source.name()} | gemeinsamer Durchlauf gescheitert, einzeln weiter: {exc}")
                 groups += [[index] for index in group]
                 continue
-            results[group[0]] = _error(items[group[0]], [("ffmpeg", str(exc))], plans[group[0]],
-                                       time.monotonic() - group_start)
-            send("warning", f"{plans[group[0]].target.name} | Fehler: ffmpeg: {exc}")
+            for index in group:
+                results[index] = _error(items[index], [("ffmpeg", str(exc))], plans[index], elapsed)
+                send("warning", f"{plans[index].target.name} | Fehler: ffmpeg: {exc}")
             continue
+        seconds = time.monotonic() - group_start
+        send("info", f"{source.name()} | Durchlauf fertig in {_media.clock(seconds)} | Encoder: {encoders}",
+             {"elapsed": seconds, "encoders": encoders})
         for position, index in enumerate(group):
-            seconds = time.monotonic() - group_start
             if position in failed:
                 results[index] = _error(items[index], [("file", failed[position])], plans[index], seconds)
             else:
