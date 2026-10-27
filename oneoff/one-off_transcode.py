@@ -16,13 +16,13 @@ import time
 import traceback
 from toolbox import tb_write_log
 import transcoder
-from transcoder import _media, _presets     # ffmpeg path, timecode arithmetic and presets of the core
+from transcoder import _media, _presets, _render  # ffmpeg access, presets and encoder check of the core
 from transcoder._source import Source
 
 
 # --------- CONFIG ---------
 app_name = "One-off Transcode"
-app_version = "0.2.1"
+app_version = "0.3.0"
 
 qc_list = "details_qc_2026-10-13_09-30-50-536327.txt"                               # Marathon details_qc_*.txt
 qc_folder = r"\\10.0.77.11\Ablage KI Proxy_1\Proxy 10 Mbit\DEFA\.marathon"          # proxies; searched including subfolders
@@ -30,7 +30,7 @@ dry_run = False                                                                 
 rules = ["video_bitrate", "fps_50", "audio_stereo"]                                 # active rules, see USE CASE
 max_video_mbit = 11                                                                 # video_bitrate: above this the video is encoded again
 wrong_fps, target_fps = 50, 25                                                      # fps_50: frame rate found, frame rate of the new file
-proxy_preset = "h264_10mbit_1080p"                                                  # encoder values for new video and new audio
+proxy_preset = "h264_10mbit_1080p_nvenc"                                                  # encoder values for new video and new audio
 duration_tolerance = 0.5                                                            # seconds the new file may differ from the original
 report_folder = "reports"                                                           # result list; relative to this file
 done_lists = ["one-off_transcode_2026-10-20_19-17-04.txt"]                          # earlier result lists; successful log entries are also skipped
@@ -275,11 +275,39 @@ def _timecode(source: Source, fps: Fraction) -> str | None:
 def _video_args(video: dict) -> list[str]:
     args = ["-c:v", video["codec"], *(["-profile:v", video["profile"]] if video.get("profile") else [])]
     args += ["-preset", video.get("x264_preset", "medium")] if video["codec"] == "libx264" else []
+    if video["codec"] == "h264_nvenc":
+        args += ["-preset", video.get("nvenc_preset", "p5"), "-tune", video.get("nvenc_tune", "hq"),
+                 "-rc", video.get("nvenc_rc", "vbr")]
     args += [option for key, name in (("bitrate", "-b:v"), ("maxrate", "-maxrate"), ("bufsize", "-bufsize"))
              if video.get(key) for option in (name, video[key])]
     if video.get("color") == "bt709":
         args += ["-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709"]
     return args
+
+
+@cache
+def _check_gpu() -> None:
+    """Check the selected ffmpeg and NVENC preset once, before the first GPU render."""
+    accelerators, _ = _media.run_text("ffmpeg", ["-hwaccels"], timeout=30)
+    if "cuda" not in accelerators.split():
+        raise RuntimeError("NVDEC nicht nutzbar: CUDA fehlt im verwendeten ffmpeg-Build. "
+                           "GPU-fähigen Build verwenden oder proxy_preset = 'h264_10mbit_1080p' setzen.")
+    _render.check_encoder(proxy_preset)
+    say("GPU-Prüfung bestanden: CUDA verfügbar und NVENC gestartet; NVDEC wird mit der Quelldatei geprüft.")
+
+
+def _gpu_download_format(source: Source) -> str:
+    """Software frame format exposed by FFmpeg's CUDA H.264 decoder; no pixel conversion."""
+    if source.video.data.get("codec_name") != "h264":
+        raise RuntimeError("NVDEC-Modus benötigt eine H.264-Quelle; für andere Codecs das CPU-Preset wählen.")
+    pix_fmt = source.video.data.get("pix_fmt", "")
+    match = re.fullmatch(r"yuvj?(420|444)p(?:(10|12)le)?", pix_fmt)
+    if not match:
+        raise RuntimeError(f"NVDEC-Pixelformat {pix_fmt!r} nicht unterstützt; "
+                           "für diese Datei proxy_preset = 'h264_10mbit_1080p' setzen.")
+    if match[1] == "444":
+        return "yuv444p16le" if match[2] else "yuv444p"
+    return {None: "nv12", "10": "p010le", "12": "p016le"}[match[2]]
 
 
 def _stereo_graph(source: Source, channels: list[int], rate: int) -> str:
@@ -293,11 +321,16 @@ def _stereo_graph(source: Source, channels: list[int], rate: int) -> str:
 
 def _command(source: Source, plan: Plan, preset: dict, part: Path, tc: str | None) -> list[str]:
     video, audio, graph, args = preset["video"], preset["audio"], [], []
+    gpu = plan.video is not None and video["codec"] == "h264_nvenc"
+    inputs = ([f"-hwaccel:v:{source.video.ordinal}", "cuda",
+               f"-hwaccel_output_format:v:{source.video.ordinal}", "cuda"] if gpu else [])
     pad = f"0:v:{source.video.ordinal}"
     if plan.video is None:
         args += ["-map", pad, "-c:v", "copy"]
     else:
-        filters = [f"fps={plan.video['fps']}"] if plan.video.get("fps") else []
+        # hwdownload must use the decoder's native format before software filters.
+        filters = ["hwdownload", f"format={_gpu_download_format(source)}"] if gpu else []
+        filters += [f"fps={plan.video['fps']}"] if plan.video.get("fps") else []
         filters += [f"format={video['pix_fmt']}"] if video.get("pix_fmt") else []
         graph.append(f"[{pad}]{','.join(filters) or 'null'}[v]")
         args += ["-map", "[v]", *_video_args(video)]
@@ -308,7 +341,7 @@ def _command(source: Source, plan: Plan, preset: dict, part: Path, tc: str | Non
         graph.append(_stereo_graph(source, plan.audio, rate))
         args += ["-map", "[a]", "-c:a", "aac", "-b:a", audio.get("bitrate", "320k"), "-ar", str(rate)]
     return [_media.tool_path("ffmpeg"), "-hide_banner", "-nostdin", "-y", "-v", "error", "-nostats", "-progress", "pipe:1",
-            "-i", str(source.files[0]), *(["-filter_complex", ";".join(graph)] if graph else []), *args,
+            *inputs, "-i", str(source.files[0]), *(["-filter_complex", ";".join(graph)] if graph else []), *args,
             "-map_metadata", "-1", "-map_chapters", "-1", *(["-timecode", tc, "-write_tmcd", "1"] if tc else []),
             *(["-movflags", "+faststart"] if preset.get("faststart") else []), "-f", "mp4", str(part)]
 
@@ -370,7 +403,10 @@ def _replace(source: Source, plan: Plan, preset: dict) -> None:
     part = target.with_name(target.name + part_suffix)
     try:
         tc = _timecode(source, (plan.video or {}).get("fps") or source.fps)
-        _run(_command(source, plan, preset, part, tc), source.duration)
+        command = _command(source, plan, preset, part, tc)
+        if plan.video is not None and preset["video"]["codec"] == "h264_nvenc":
+            _check_gpu()
+        _run(command, source.duration)
         if problems := _check(source, plan, part, tc):
             raise RuntimeError(f"Prüfung der neuen Datei: {'; '.join(problems)}")
         os.replace(part, target)
@@ -451,6 +487,8 @@ def main() -> None:
     mode = "Testlauf, nichts wird geändert" if dry_run else "Dateien werden ersetzt"
     say(f"{version_text} · {mode}")
     preset = _presets.load(proxy_preset)[1]
+    video_mode = "NVDEC/NVENC bei Video-Neuberechnungen" if preset["video"]["codec"] == "h264_nvenc" else "CPU"
+    say(f"Video-Modus: {video_mode} · Preset {proxy_preset}")
     listed, done_paths = _latest(_read_qc(_local(qc_list))), _done_lists()
     done = _done_names(done_paths) | _done_log_names(main_log)
     entries = [entry for entry in listed if entry.name.casefold() not in done]
@@ -463,7 +501,8 @@ def main() -> None:
     title = f"{app_name} · Ergebnisliste"
     _write(path, [title, "=" * len(title), *_rows([("Start", f"{started:%Y-%m-%d %H:%M:%S}"), ("Versionen", version_text),
                                                      ("Modus", mode), ("QC-Liste", qc_list), ("QC-Ordner", qc_folder),
-                                                     ("Regeln", ", ".join(rules)), ("Erledigt", done_text)])])
+                                                     ("Regeln", ", ".join(rules)), ("Preset", proxy_preset),
+                                                     ("Video-Modus", video_mode), ("Erledigt", done_text)])])
     counts = Counter()
     for entry in entries:
         _process(entry, index, preset, path, counts)
