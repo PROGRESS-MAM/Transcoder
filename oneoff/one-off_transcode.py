@@ -22,7 +22,7 @@ from transcoder._source import Source
 
 # --------- CONFIG ---------
 app_name = "One-off Transcode"
-app_version = "0.2.0"
+app_version = "0.2.1"
 
 qc_list = "details_qc_2026-10-13_09-30-50-536327.txt"                               # Marathon details_qc_*.txt
 qc_folder = r"\\10.0.77.11\Ablage KI Proxy_1\Proxy 10 Mbit\DEFA\.marathon"          # proxies; searched including subfolders
