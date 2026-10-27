@@ -33,7 +33,7 @@ wrong_fps, target_fps = 50, 25                                                  
 proxy_preset = "h264_10mbit_1080p"                                                  # encoder values for new video and new audio
 duration_tolerance = 0.5                                                            # seconds the new file may differ from the original
 report_folder = "reports"                                                           # result list; relative to this file
-done_lists = ["one-off_transcode_2026-10-20_19-17-04.txt"]                          # earlier result lists; OK clips are not rendered again
+done_lists = ["one-off_transcode_2026-10-20_19-17-04.txt"]                          # earlier result lists; successful log entries are also skipped
 
 # Exe: files next to the exe; the exe content is unpacked to sys._MEIPASS.
 base_path = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
@@ -48,6 +48,7 @@ row_pattern = re.compile(r" {4}(\S+)\s+(.*)")
 error_pattern = re.compile(r"(\S+?\(.*?\)): (\w+) (.*)")
 ist_pattern = re.compile(r"Stream (\d+): (\w+=[^,]*(?:, \w+=[^,]*)*)")
 value_pattern = re.compile(r"(\d+(?:\.\d+)?)\s*([kM]?)")
+done_log_pattern = re.compile(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}: (.+) \| ersetzt in \d{2}:\d{2}:\d{2}")
 units = {"": 1, "k": 1e3, "M": 1e6}
 count_labels = {"ok": "ersetzt", "geplant": "geplant (Testlauf)", "fehler": "mit Fehler", "übersprungen": "übersprungen",
                 "ohne Regel": "ohne passende Regel"}
@@ -146,6 +147,17 @@ def _done_lists() -> list[Path]:
 def _done_names(paths: list[Path]) -> set[str]:
     """File names with status OK; result lists use the entry layout of the QC list, the title is the file name."""
     return {entry.title.casefold() for path in paths for entry in _read_qc(path) if entry.status == "OK"}
+
+
+def _done_log_names(path: Path) -> set[str]:
+    """File names successfully replaced according to the main log."""
+    if not path.is_file():
+        return set()
+    return {
+        match[1].casefold()
+        for line in path.read_text(encoding="utf-8-sig").splitlines()
+        if (match := done_log_pattern.fullmatch(line))
+    }
 
 
 def _value(text: str) -> float | None:
@@ -440,9 +452,10 @@ def main() -> None:
     say(f"{version_text} · {mode}")
     preset = _presets.load(proxy_preset)[1]
     listed, done_paths = _latest(_read_qc(_local(qc_list))), _done_lists()
-    done = _done_names(done_paths)
+    done = _done_names(done_paths) | _done_log_names(main_log)
     entries = [entry for entry in listed if entry.name.casefold() not in done]
-    done_text = f"{len(listed) - len(entries)} schon gerechnet laut {', '.join(path.name for path in done_paths)}"
+    done_sources = [*(path.name for path in done_paths), main_log.name]
+    done_text = f"{len(listed) - len(entries)} schon gerechnet laut {', '.join(done_sources)}"
     say(f"{len(listed)} abgelehnte Dateien in der QC-Liste, davon {done_text}; suche {len(entries)} im QC-Ordner …")
     index = _index(Path(qc_folder), {entry.name.casefold() for entry in entries})
     say(f"{len(index)} davon im QC-Ordner gefunden")
