@@ -85,8 +85,8 @@ def read_chunks(args: list[str], chunk_size: int, stderr: list[str] | None = Non
 
 
 def probe(path: Path) -> dict:
-    """ffprobe format and streams of one file."""
-    stdout, _ = run_text("ffprobe", ["-v", "error", "-print_format", "json", "-show_format", "-show_streams", str(path)])
+    """ffprobe format, streams and chapters of one file."""
+    stdout, _ = run_text("ffprobe", ["-v", "error", "-print_format", "json", "-show_format", "-show_streams", "-show_chapters", str(path)])
     return json.loads(stdout or "{}")
 
 

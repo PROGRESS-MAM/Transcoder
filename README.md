@@ -125,20 +125,20 @@ Jeder Output wird einzeln betrachtet: Ein Output mit Fehler (z. B. Fix nicht sic
 |---|---|---|
 | `streams` | aus den Metadaten: Container, Operational Pattern und Package-ID (MXF), Codecs, Profil, Größe, SAR/DAR, fps, Feldreihenfolge, Pixelformat, Bitrate, Dauer, Start-TC, Audio-Spuren/Kanäle/Layout, Encoder-Angaben (inkl. x264-Optionen) | – |
 | `interlace` | Feldreihenfolge aus den Metadaten, gemessene Anteile interlaced/progressiv, `rating`: `interlaced` / `progressive` / `unclear`, `trust` | `interlaced` → deinterlacen; `progressive` → nichts |
-| `black_bars` | Schwarzpegel (niedrigster Pegel im Bild), Ränder je Seite (`bars`), aktive Bildfläche (`active`), `rating`: `bars` / `none` / `unclear`, `trust` | `bars` → Beschnitt auf `active`, an Seiten mit Rand zusätzlich `extra_crop` Pixel, Einpassen in den Bildrahmen des Presets; `none` → nichts |
+| `black_bars` | obere/untere Ränder, `bars.left = bars.right = 0`, aktive Fläche, `rating` und `trust` | nur oben/unten beschneiden, `extra_crop` ausschließlich an einer Seite mit erkanntem Rand |
 | `audio` | je Kanal Anteil mit Ton und Spitzenpegel, `audible` (Liste der hörbaren Kanäle), je Kanalpaar Ähnlichkeit (pegelunabhängig), Zeitversatz und Pegelunterschied, `duplicates`, `trust` | siehe unten |
 
 - **Stichproben:** über die Laufzeit verteilt (`samples.per_minute`, `samples.seconds`) oder über die volle Länge (`samples.full`).
 - **Statistik:** Die Stichproben werden gemeinsam ausgewertet; Ausreißer fallen heraus, z. B. Schwarz am Anfang und Ende oder sehr dunkle Szenen bei `black_bars`. Jede Bewertung hat ein `trust` von 0 bis 1 aus Anzahl und Übereinstimmung der Stichproben (bei `samples.full` für den Ton 1).
 - **Sicherheit:** Ein Fix ändert nur, wenn seine Bewertung mindestens das `trust` seines Abschnitts erreicht; sonst `error` mit Bewertung und erreichter Sicherheit. Für vage Fälle `trust` erhöhen, z. B. `"audio": {"trust": 0.99}`.
-- **`black_bars`:** Schwarz ist der niedrigste Pegel, der im Bild vorkommt; Ränder sind Zeilen bzw. Spalten, die in allen gültigen Stichproben auf diesem Pegel bleiben. Wechselnde Bildformate in der Source (z. B. 4:3 und Cinemascope) bleiben vollständig erhalten.
+- **`black_bars`:** Nur Zeilen oben/unten werden bewertet. Schwarz liegt nach Graustufendecodierung bei 0, Toleranz 6 von 255; ein dunklerer Bildbereich wird nicht zum Schwarzreferenzwert erklärt. Verwendet wird der kleinste Rand über alle gültigen Bilder; seitliche Balken lösen keinen Fix aus. Die Erkennung bleibt stichprobenbasiert: Für die ersten Läufe Master manuell vergleichen.
 - **`interlace`:** Die Metadaten sind die erste Angabe; die Messung bestätigt sie. Mit `"interlace": {"source": "metadata"}` gilt nur die Angabe in den Metadaten, ohne Messung.
 - **Stille** wird wie im AQC-Prüftool `digital_silence` gemessen: je Kanal Fenster der Länge `audio.silence_window`, ein Fenster zählt als Ton bei Pegel (RMS) ≥ `audio.silence_threshold`; ein Kanal ist hörbar, wenn sein Anteil an Fenstern mit Ton mindestens `audio.silence_min_active` beträgt. Zusätzlich vergleicht der Transcoder die Kanäle untereinander.
 
 | Fix | Ergebnis |
 |---|---|
-| `fix("audio", channels=2)` | genau 2 hörbare Kanäle: Kanal 1 und 2 hörbar, weitere Kanäle doppelt zu 1/2 oder still → `[1, 2]`; genau 1 Kanal hörbar → `[n, n]` ohne Panning und ohne Pegeländerung; sonst `error` |
-| `fix("audio", min_audible=2)` | mindestens 2 hörbare Kanäle, je Kanal eine Spur, kein Mixdown: Kanal 1 und 2 hörbar → Layout unverändert; genau 1 Kanal hörbar → `[n, n]`; sonst `error` |
+| `fix("audio", channels=2)` | erste zwei sicher hörbare Kanäle in Quellreihenfolge; weitere hörbare Kanäle müssen sichere Dubletten sein, sonst `error`. Stumme Kanäle entfallen. Genau ein hörbarer Kanal → `[n, n]` |
+| `fix("audio", min_audible=2)` | alle sicher hörbaren Kanäle in Quellreihenfolge als Einzelspuren, stumme Kanäle entfernen. Genau ein hörbarer Kanal → `[n, n]`; kein Ton oder unsichere Kanalbewertung → `error` |
 
 ### Einstellungen
 
@@ -183,6 +183,14 @@ transcoder.render(src, web)
 
 Ein Abschnitt kann auch eigene `samples` enthalten, die für diese Prüfung gelten, z. B. `"audio": {"samples": {"full": True}}`. Der Beschnitt wird bei Bedarf auf gerade Werte nach innen gerundet (4:2:0).
 
+### Master-Nachprüfung und Metadaten
+
+- Die Quell-framerate wird ausdrücklich gesetzt. Bei DNxHD 185x interlaced sind nur 25 Frames/s zulässig; andere fps führen zur Fehlerliste, der Clip wird nicht transcodiert. Die Bildgröße darf für DNxHD auf 1920×1080 angepasst werden.
+- Vor dem Marathon-Render wird ein generiertes Testbild mit dem Zielcodec erzeugt und decodiert. Nicht sicher übertragbare Farbangaben und Zusatzmetadaten (z. B. HDR-Side-Data oder Rotation) führen zu einer manuellen Fehlermeldung statt zu stiller Änderung.
+- `preserve_metadata = true` in den DNx-Master-Presets übernimmt Container- und Stream-Metadaten, Kapitel sowie bekannte Farbangaben. `video.color = "source"` nimmt keine pauschale BT.709-Umwandlung vor. Codecabhängige Eigenschaften wie Kompression, Pixelformat, Bitrate und Zeitbasis ergeben sich aus dem Zielcodec.
+- Nach dem Encode werden Codec/Profil, Bildgröße, SAR, Framerate, Framezahl, Scan/Feldreihenfolge, PCM-Kanäle, Samplerate, Bittiefe, Timecode und bekannte Farbangaben geprüft. Bei Abweichungen wird der Master nicht freigegeben. Diese technische Prüfung ersetzt nicht den manuellen Bildvergleich.
+- Ein Stereo-Proxy verwirft weiterhin keine zusätzlichen eigenständigen Toninhalte stillschweigend; solche Quellen bleiben zur manuellen Prüfung blockiert. Der Master-Audio-Fix selbst erhält alle hörbaren Kanäle.
+
 ## Merge und Timecode
 
 `merge` legt die Segmente eines Outputs und ihre Reihenfolge fest; ohne `merge` nur die Source. Segmente sind Dateien, `black(seconds)` und `SOURCE`. Welche Dateien passen, entscheidet der Aufrufer.
@@ -208,16 +216,18 @@ Unterlauf über 00:00:00:00 → Umlauf über 24 h. Beispiel: 9-s-Vorspann plus `
 
 ## Presets
 
+`preserve_metadata` ist ein optionaler boolescher Eintrag auf Preset-Ebene (Standard `false`; DNx-Master: `true`). `video.fit` ist `contain` oder `cover` (Standard `contain`); `video.color` ist `bt709` oder `source`.
+
 Ein Preset beschreibt nur das Ausgabeformat. Datei `transcoder/presets/<name>.toml` oder Pfad zu einer TOML-Datei; `extends` übernimmt ein anderes Preset, eigene Einträge überschreiben dessen Werte.
 
 | Preset | Format | Bildrahmen |
 |---|---|---|
 | `h264_10mbit_1080p` | MP4, H.264 High, 8 bit 4:2:0, BT.709, 10 Mbit/s, quadratische Pixel, progressiv, fps der Source; AAC 320 kbit/s Stereo 48 kHz | 1920×1080 |
 | `h264_10mbit_1080p_nvenc` | wie `h264_10mbit_1080p`, H.264-Encoding mit NVIDIA NVENC statt libx264; p5, HQ, VBR | 1920×1080 |
-| `dnxhr_hqx` | MOV, DNxHR HQX, fps und Scan-Art der Source; PCM in Samplerate und Bittiefe der Source (mind. 16 bit), je Kanal eine Spur | Raster: 1920×1080, 3840×2160, 2048×1080, 1998×1080, 2048×858, 4096×2160, 3996×2160, 4096×1716 |
-| `dnxhd_185x` | MOV, DNxHD 185x interlaced (Feldreihenfolge der Source), 25 fps; PCM wie oben | 1920×1080 |
+| `dnxhr_hqx` | MOV, DNxHR HQX 10 Bit 4:2:2, Quell-fps und Quell-SAR; Quellmetadaten soweit sicher übertragbar; einzelne PCM-Kanäle, 48 kHz, 24 Bit | Quellbildgröße, proportional ausfüllen (`fit = "cover"`) |
+| `dnxhd_185x` | MOV, DNxHD 185x interlaced, Quell-Feldreihenfolge; 25 Frames/s ohne Framerateänderung; Audio/Metadaten wie oben | 1920×1080, proportional ausfüllen |
 
-Einpassen in den Bildrahmen immer ohne Beschnitt: die begrenzende Seite füllt den Rahmen (4:3 in 16:9: die Höhe), Ränder nur auf der anderen Achse. Bei `frame = "raster"` zählt das Bild nach dem Beschnitt: Entspricht es einem Raster aus `rasters`, bleibt es unverändert; sonst gilt von allen Rastern, die das Bild aufnehmen, das mit dem ähnlichsten Seitenverhältnis (bei Gleichstand das kleinere), z. B. SD 16:9 → 1920×1080, Letterbox nach Beschnitt 1920×800 → 2048×858; größere Bilder kommen in das größte Raster.
+`video.fit = "contain"` (Standard) passt proportional ein und füllt Überstand mit Schwarz auf. `video.fit = "cover"` vergrößert proportional bis der Zielrahmen vollständig gefüllt ist und schneidet Überstand mittig ab. Nach vertikalem Beschnitt bei gleichem Quell-/Zielrahmen wird dadurch auch seitlich beschnitten; dort können echte Bildinhalte betroffen sein. Beispiel: 1920×1080, oben/unten je 50+10 Pixel weg → 1920×960 → 2160×1080 → links/rechts je 120 Pixel weg. Die Master-Presets verwenden die Quellgröße statt eines Rasters; nur DNxHD verwendet 1920×1080. Eigene Raster-Presets bleiben nutzbar.
 
 Beispiel `transcoder/presets/h264_10mbit_1080p.toml`:
 
@@ -427,9 +437,9 @@ Als EXE: `transcode_marathon_<version>.exe` auf den Rechner kopieren und starten
 Je Job: Source aus `inputs`, Analyse (`streams`, `audio`, `black_bars`, `interlace`), dann ein `render`:
 
 - Proxy immer: `proxy_preset` mit `fix("audio", channels=2)`, `fix("black_bars")`, `fix("interlace")`.
-- Neuer Master, wenn genau 1 Kanal hörbar ist, eindeutige schwarze Ränder bei progressiver Quelle vorliegen oder `"ffe_tafel": true`:
+- Neuer Master bei einem hörbaren Kanal, entfallenden stummen Kanälen, oberen/unteren schwarzen Balken oder `"ffe_tafel": true`:
   - progressiv: `master_preset` mit `fix("audio", min_audible=2)` und `fix("black_bars")`,
-  - interlaced: `master_preset_interlaced` nur mit `fix("audio", min_audible=2)`; interlaced Master werden nie beschnitten.
+  - interlaced: `master_preset_interlaced` mit Audio-Fix und vertikalem Beschnitt; feldgerecht skalieren, Feldreihenfolge erhalten.
 - Dual-Mono erzeugt keinen neuen Master.
 - Ist ein neuer Master nötig und das Interlacing unklar, endet der Job ohne Rendern mit `rejected`.
 - FFE-Tafel bei `"ffe_tafel": true`: Der Adapter wählt aus `ffe_reference_clips` die eine Tafel mit Bildgröße und fps der Source (keine oder mehrere → `rejected`). Proxy und Master bekommen `merge = [<Tafel>, black(ffe_black_seconds), SOURCE]` und `timecode(anchor=SOURCE)`: Tafel (9 s) plus 1 s Schwarz = 10 s vor dem Film, der Film beginnt beim alten Start-TC.
@@ -438,7 +448,7 @@ Je Job: Source aus `inputs`, Analyse (`streams`, `audio`, `black_bars`, `interla
 ### Verarbeitung und Fehler
 
 - Nach dem Lesen der Streams zuerst fehlenden Ton und bei FFE-Jobs die passende Tafel prüfen. Nach der Audioanalyse die benötigten Audiobelegungen prüfen. Steht eine Ablehnung bereits fest, keine Rand- oder Interlaceanalyse mehr starten.
-- Bei identischen Stichprobeneinstellungen Ränder und Interlace gemeinsam aus einmal decodierten Stichproben bestimmen. Individuelle Einstellungen je Prüfung und `samples.full` bleiben nutzbar. Die Auswertung und QC-Schwellen bleiben unverändert.
+- Bei identischen Stichprobeneinstellungen Ränder und Interlace gemeinsam aus einmal decodierten Stichproben bestimmen. Individuelle Einstellungen je Prüfung und `samples.full` bleiben nutzbar. Die Vertrauensschwellen bleiben unverändert; die Balkenauswertung berücksichtigt ausschließlich obere/untere schwarze Ränder.
 - Bei erfolgreichem Rendern Proxy und ggf. Master weiterhin in einem gemeinsamen ffmpeg-Durchlauf erzeugen; die Quelle nur einmal einlesen.
 - Den Scanmodus des Marathon-Masters an der eindeutigen Interlaceanalyse ausrichten: progressive Ausgabe mit DNxHR HQX, interlaced Ausgabe mit DNxHD 185x und der ermittelten Feldreihenfolge. Veraltete `-top`-Encoderoptionen nicht verwenden.
 - Bei erkannten ungültigen Encoderoptionen oder einer ffmpeg-Assertion kein erneutes internes Rendern der Einzeloutputs versuchen. Fehler ausdrücklich protokollieren. Nicht als dauerhaft erkannte Fehler können weiterhin in Einzeloutputs eingegrenzt werden.
@@ -465,8 +475,8 @@ Voraussetzung: `ffmpeg` und `ffprobe` liegen in `res/`, sonst bricht der Build a
 | `poll_seconds` | `30` | Wartezeit, wenn der Pool leer ist |
 | `heartbeat_seconds` | `30` | Abstand der Lebenszeichen an Marathon, 1 bis 60 |
 | `proxy_preset` | `h264_10mbit_1080p_nvenc` | NVIDIA-Proxy; `h264_10mbit_1080p` für expliziten CPU-Betrieb |
-| `master_preset` | `dnxhr_hqx` | Preset neuer Master aus progressiven Quellen (`frame = "raster"`: FHD, UHD, 2K, 4K) |
-| `master_preset_interlaced` | `dnxhd_185x` | Preset neuer Master aus interlaced Quellen |
+| `master_preset` | `dnxhr_hqx` | Master aus progressiven Quellen: Quellbildgröße, proportionaler Beschnitt/Zoom, PCM-Einzelspuren 48 kHz/24 Bit |
+| `master_preset_interlaced` | `dnxhd_185x` | Master aus interlaced Quellen: 1920×1080, Quell-Feldreihenfolge, 25 Frames/s; andere fps → Fehler ohne Transcode |
 | `ffe_black_seconds` | `1` | Schwarz zwischen Tafel und Film |
 | `settings` | `{"samples": {"per_minute": 5, "seconds": 2}, "black_bars": {"extra_crop": 10}}` | Marathon-Vorgaben: 5 Stichproben pro Minute à 2 Sekunden, zusätzlicher Beschnitt 10 Pixel; QC-Schwellen unverändert |
 | `log_progress_seconds` | `30` | Abstand der Fortschrittswerte im Log; laufende Konsolenanzeige bleibt erhalten |
@@ -484,7 +494,7 @@ Die Halbierung betrifft nur die Marathon-Vorgabe `settings.samples.per_minute`: 
 | `error` aus Analyse, Fix, Segmenten oder Tonlayout (`step` `fix:…`, `merge`, `audio`, `source`), keine passende Tafel, neuer Master bei unklarem Interlacing | `rejected` | `Manuelle Prüfung: <Fehlerbericht>` |
 | `error` mit `step` `ffmpeg`, `file`, `preset` oder `timecode`, Source nicht lesbar, Job ungültig | `failed` | Fehlerbericht bzw. `Job ungültig: …` |
 
-`rejected` behandelt Marathon bis zur Umsetzung von CR-015 wie `failed` (zweiter Versuch, danach inaktiv). `preset` im Report: Proxy-Preset, mit neuem Master `<proxy_preset>+<master_preset>`. `new_master` nur, wenn ein neuer Master im Ausgang liegt; Marathon verschiebt ihn nach `master_dir`.
+Marathon 1.18.0 behandelt Transcode-`rejected` als manuell blockiert, ohne erneuten Transcode-Versuch. Ältere Marathon-Versionen behandeln es noch wie `failed`. `preset` im Report: Proxy-Preset, mit neuem Master `<proxy_preset>+<master_preset>`. `new_master` nur, wenn ein neuer Master im Ausgang liegt; Marathon verschiebt ihn nach `master_dir`.
 
 Ungültig sind Jobs ohne `inputs` (nicht leere Liste), ohne `proxy_name`, ohne `ffe_tafel` (`true`/`false`), mit `"ffe_tafel": true` ohne `ffe_reference_clips` und Jobs ohne `identifier` oder `title`. Der Adapter verarbeitet nur Jobs mit `schema_version = 6`.
 
@@ -499,3 +509,13 @@ Ungültig sind Jobs ohne `inputs` (nicht leere Liste), ohne `proxy_name`, ohne `
 | `<work_dir>/worker/FFE Filmerbe/*.mov` (`ffe_reference_clips`) | FFE-Tafeln, werden nur gelesen |
 | `inputs` aus dem Job | Master, werden nur gelesen |
 | `output_folder` aus dem Job | Proxy, neuer Master, Protokolle |
+
+## Lokale Regressionstests
+
+Die Tests erzeugen ausschließlich temporäre lokale Testdateien; keine Produktionsablage und keine Zugangsdaten werden verwendet. Im jeweiligen Repository starten:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+Für die Medienprüfungen müssen `ffmpeg`, `ffprobe` und `numpy` verfügbar sein. Es werden künstliche Bilder und Töne verwendet.

@@ -258,29 +258,25 @@ def _edge(lines: np.ndarray, limit: float) -> int:
 
 def _rate_black_bars(source: Source, values: dict, samples: list[list[FrameLines]]) -> dict:
     full = values["samples"]["full"]
-    lines = [line for frames in samples for frame in frames for line in frame]
-    if not lines:
+    rows_found = [rows for frames in samples for rows, _ in frames]
+    if not rows_found:
         return {"rating": "unclear", "trust": 0.0, "reason": "keine Bilder lesbar"}
-    # Black is the lowest level found: the mean of the darkest line, i.e. the bars if there are any.
-    black = float(min(line.min() for line in lines))
-    limit = black + black_tolerance
+    # Gray decoding expands video black to zero; a dark gradient is not a black reference.
+    limit = black_tolerance
+    black = float(min(rows.min() for rows in rows_found))
     sides = []
     for frames in samples:
-        valid = [(rows, cols) for rows, cols in frames if rows.max() > limit]
+        valid = [rows for rows, _ in frames if rows.max() > limit]
         if valid:
-            sides.append([(_edge(rows, limit), _edge(rows[::-1], limit), _edge(cols, limit), _edge(cols[::-1], limit))
-                          for rows, cols in valid])
+            sides.append([(_edge(rows, limit), _edge(rows[::-1], limit)) for rows in valid])
     if not sides:
         return {"rating": "unclear", "trust": 0.0, "black_level": round(black, 1), "reason": "nur schwarze Bilder"}
-    # Taking the minimum per side keeps every picture area seen in any sample, so mixed formats stay complete;
-    # dark scenes and fades only show wider bars and cannot shrink the picture.
-    per_sample = [tuple(min(values) for values in zip(*frames)) for frames in sides]
-    top, bottom, left, right = (min(values) for values in zip(*per_sample))
-    bars = {"top": top, "bottom": bottom, "left": left, "right": right}
-    active = (left, top, source.width - left - right, source.height - top - bottom)
+    per_sample = [tuple(min(items) for items in zip(*frames)) for frames in sides]
+    top, bottom = (min(items) for items in zip(*per_sample))
+    bars = {"top": top, "bottom": bottom, "left": 0, "right": 0}
+    active = (0, top, source.width, source.height - top - bottom)
     voters = sum(map(len, sides)) if full else len(sides)
-    rating = "bars" if any(bars.values()) else "none"
-    # Rule of succession: chance that an unseen sample keeps its picture inside the same area.
+    rating = "bars" if top or bottom else "none"
     trust = 1.0 if rating == "none" else round((voters + 1) / (voters + 2), 4)
     return {"rating": rating, "trust": trust, "black_level": round(black, 1), "bars": bars, "active": active,
             "size": (source.width, source.height), "samples": len(samples), "valid_samples": len(sides),
@@ -464,20 +460,18 @@ def fix_interlace(found: dict, values: dict, scan: str) -> tuple[dict, str | Non
 
 
 def fix_black_bars(found: dict, values: dict, width: int, height: int) -> tuple[dict, str | None]:
+    """Crop top and bottom only; retain field alignment for interlaced video."""
     _sure(found, values["trust"], "Schwarze Ränder")
-    if found["rating"] == "none":
+    bars, extra = found.get("bars", {}), values["extra_crop"]
+    if found["rating"] == "none" or not (bars.get("top") or bars.get("bottom")):
         return {}, None
-    bars, extra = found["bars"], values["extra_crop"]
-    left = bars["left"] + (extra if bars["left"] else 0)
-    top = bars["top"] + (extra if bars["top"] else 0)
-    right = width - bars["right"] - (extra if bars["right"] else 0)
-    bottom = height - bars["bottom"] - (extra if bars["bottom"] else 0)
-    # 4:2:0 needs even values; rounding goes inwards.
-    left, top, right, bottom = left + left % 2, top + top % 2, right - right % 2, bottom - bottom % 2
-    if right - left < 2 or bottom - top < 2:
+    top = bars.get("top", 0) + (extra if bars.get("top") else 0)
+    bottom = height - bars.get("bottom", 0) - (extra if bars.get("bottom") else 0)
+    top, bottom = top + top % 2, bottom - bottom % 2
+    if bottom - top < 2:
         raise FixError(f"Schwarze Ränder: keine Bildfläche übrig ({bars}).")
-    box = (left, top, right - left, bottom - top)
-    return {"crop": box}, f"beschnitten auf {box[2]}×{box[3]} bei {box[0]},{box[1]}"
+    box = (0, top, width, bottom - top)
+    return {"crop": box}, f"beschnitten auf {box[2]}×{box[3]} bei 0,{box[1]}"
 
 
 def fix_audio(found: dict, values: dict, target: dict, count: int) -> tuple[dict, str | None]:
@@ -488,18 +482,21 @@ def fix_audio(found: dict, values: dict, target: dict, count: int) -> tuple[dict
     audible = found["audible"]
     if len(audible) == 1:
         return {"audio_map": [audible[0], audible[0]]}, f"Kanal {audible[0]} auf [{audible[0]}, {audible[0]}]"
-    if not {1, 2} <= set(audible):
-        raise FixError(f"Ton: hörbar {', '.join(map(str, audible)) or 'keiner'}; erwartet Kanal 1 und 2 oder genau "
-                       f"1 hörbaren Kanal")
     if "min_audible" in target:
-        return {}, None
+        if len(audible) < target["min_audible"]:
+            raise FixError("Ton: kein hörbarer Kanal; Master kann nicht erzeugt werden")
+        dropped = [number for number in range(1, count + 1) if number not in audible]
+        return {"audio_map": list(audible)}, f"stumme Kanäle {dropped} entfernt" if dropped else None
+    if len(audible) < 2:
+        raise FixError("Ton: kein hörbarer Kanal")
+    selected = audible[:2]
     pairs = {tuple(pair["channels"]): pair for pair in found["pairs"]}
-    for channel in (number for number in audible if number > 2):
-        matches = [pairs.get((first, channel)) for first in (1, 2)]
+    for channel in audible[2:]:
+        matches = [pairs.get((first, channel)) for first in selected]
         if not any(pair and pair["duplicate"] for pair in matches):
             best = max((pair["similarity"] or 0 for pair in matches if pair), default=0)
             raise FixError(f"Ton: Kanal {channel} hörbar und nicht doppelt zu Kanal 1/2 (Ähnlichkeit {best:.2f})")
         if any(pair and pair["duplicate"] and pair["trust"] < need for pair in matches):
             raise FixError(f"Ton: Dublette mit Kanal {channel} unsicher (trust < {need:.2f})")
-    dropped = list(range(3, count + 1))
-    return {"audio_map": [1, 2]}, f"Kanäle 1, 2 ({', '.join(map(str, dropped))} verworfen)" if dropped else None
+    dropped = [number for number in range(1, count + 1) if number not in selected]
+    return {"audio_map": selected}, f"Kanäle {selected} ({', '.join(map(str, dropped))} verworfen)" if dropped else None

@@ -11,11 +11,11 @@ preset_folder = Path(__file__).resolve().parent / "presets"
 
 # --------- STATIC ---------
 schema = {
-    "extends": str, "container": ("mp4", "mov"), "faststart": bool,
-    "video": {"codec": ("libx264", "h264_nvenc", "dnxhd"), "profile": str, "pix_fmt": str, "color": ("bt709",), "bitrate": str,
+    "extends": str, "container": ("mp4", "mov"), "faststart": bool, "preserve_metadata": bool,
+    "video": {"codec": ("libx264", "h264_nvenc", "dnxhd"), "profile": str, "pix_fmt": str, "color": ("bt709", "source"), "bitrate": str,
               "maxrate": str, "bufsize": str, "x264_preset": str,
               "nvenc_preset": tuple(f"p{number}" for number in range(1, 8)), "nvenc_tune": str, "nvenc_rc": str,
-              "frame": str, "rasters": list,
+              "frame": str, "rasters": list, "fit": ("contain", "cover"),
               "scan": ("progressive", "interlaced", "source")},
     "audio": {"codec": ("aac", "pcm"), "bitrate": str, "sample_rate": int, "bit_depth": ("source", 16, 24),
               "layout": ("stereo", "tracks")},

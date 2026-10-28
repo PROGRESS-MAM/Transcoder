@@ -16,7 +16,7 @@ from transcoder._source import Source
 
 # --------- CONFIG ---------
 app_name = "Transcode Marathon"
-app_version = "0.2.0"
+app_version = "0.3.0"
 
 root_path = Path(r"\\10.0.77.11\Ablage KI Proxy_1\Proxy 10 Mbit")   # like root_path in Marathon's res/config.ini
 work_dir = ".marathon"                      # like work_dir in Marathon's res/config.ini
@@ -210,10 +210,11 @@ def _job_report(results: list, preset: str) -> adapter.JobReport:
 
 # --------- FUNC USE CASE ---------
 def _master_reasons(reports: dict, ffe: bool) -> list[str]:
-    """Reasons for a new master: exactly 1 audible channel, black bars of a progressive source, FFE plate."""
+    """Reasons for a new master: mono, silent channels, horizontal black bars or FFE plate."""
     found = ((len(reports["audio"]["audible"]) == 1, "1 hörbarer Kanal"),
-             (reports["black_bars"]["rating"] == "bars" and reports["interlace"]["rating"] == "progressive",
-              "schwarze Ränder"), (ffe, "FFE-Tafel"))
+             (reports["black_bars"]["rating"] == "bars",
+              "schwarze Ränder"),
+             (len(reports["audio"]["audible"]) < len(reports["audio"]["channels"]), "stumme Kanäle"), (ffe, "FFE-Tafel"))
     return [text for hit, text in found if hit]
 
 
@@ -286,7 +287,11 @@ def run_job(job: dict, output_folder: Path, log_path: Path) -> adapter.JobReport
     if reasons:
         interlaced = scan == "interlaced"
         master = master_preset_interlaced if interlaced else master_preset
-        fixes = [_fix("audio", min_audible=2)] + ([] if interlaced else [_fix("black_bars")])
+        try:
+            _render.check_source_encoder(source, master)
+        except (OSError, RuntimeError, ValueError) as exc:
+            return _manual([f"Master nicht kompatibel: {exc}"], preset)
+        fixes = [_fix("audio", min_audible=2), _fix("black_bars")]
         items.append(transcoder.output(master, output_folder / _master_name(job), fixes, merge=merge, timecode=code))
         preset = f"{preset}+{_name(master)}"
         adapter.log(f"Neuer Master {master}: {', '.join(reasons)}")

@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path
 import math
+import json
 import os
 import subprocess
 import tempfile
@@ -80,7 +81,7 @@ def _frame(source: Source, preset: dict, crop: tuple[int, int, int, int] | None)
     if frame == "raster":
         width, height = (crop[2], crop[3]) if crop else (source.width, source.height)
         return (*_raster(width, height, source.sar, preset["video"]["rasters"]), Fraction(1))
-    return (*_presets.frame_size(frame), Fraction(1))
+    return (*_presets.frame_size(frame), source.sar if preset.get("preserve_metadata") else Fraction(1))
 
 
 def _even(value: float) -> int:
@@ -168,6 +169,13 @@ def prepare(source: Source, output, progress: _analysis.Progress, segment_cache:
         errors.append(("file", f"Zieldatei vorhanden: {target}"))
     if not source.video or not source.fps:
         raise PrepareError([*errors, ("source", "Source hat kein lesbares Video")])
+    if preset.get("preserve_metadata"):
+        if output.merge and any(data.get("chapters") for data in source.probes):
+            raise PrepareError([*errors, ("source", "Kapitel mit zusätzlichen Segmenten nicht sicher übertragbar; manuelle Prüfung nötig")])
+        try:
+            check_source_encoder(source, output.preset)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise PrepareError([*errors, ("source", f"Master nicht kompatibel: {exc}")]) from exc
     scan = preset["video"]["scan"]
     interlaced = source.field_order in ("tff", "bff")
     field_order = (source.field_order if interlaced else "tff") if scan == "interlaced" else \
@@ -258,17 +266,26 @@ def _picture(plan: Plan, width: int, height: int, sar: Fraction, crop, deinterla
     parity = source_field if source_field in ("tff", "bff") else "auto"
     filters = [f"bwdif=mode=send_frame:parity={parity}:deint=all"] if deinterlace else []
     if crop:
-        filters.append(f"crop={crop[2]}:{crop[3]}:{crop[0]}:{crop[1]}")
+        filters.append(f"crop={crop[2]}:{crop[3]}:{crop[0]}:{crop[1]}:exact=1")
         width, height = crop[2], crop[3]
     frame_width, frame_height, frame_sar = plan.frame
-    size = fit(width, height, sar, plan.frame)
+    cover = plan.preset["video"].get("fit", "contain") == "cover"
+    if cover:
+        scale = max(Fraction(frame_width) * frame_sar / (width * sar), Fraction(frame_height, height))
+        # Round outwards, so rounding never creates a new border.
+        size = (math.ceil(width * sar * scale / frame_sar / 2) * 2, math.ceil(height * scale / 2) * 2)
+    else:
+        size = fit(width, height, sar, plan.frame)
     if size != (width, height) or sar != frame_sar:
         color = ":in_color_matrix=auto:out_color_matrix=bt709" if plan.preset["video"].get("color") == "bt709" else ""
         filters.append(f"scale={size[0]}:{size[1]}:flags=lanczos{':interl=1' if plan.field else ''}{color}")
     if size != (frame_width, frame_height):
-        filters.append(f"pad={frame_width}:{frame_height}:{(frame_width - size[0]) // 4 * 2}:"
-                       f"{(frame_height - size[1]) // 4 * 2}:color=black")
-    filters += [f"setsar={frame_sar.numerator}/{frame_sar.denominator}"]
+        x, y = (size[0] - frame_width) // 4 * 2, (size[1] - frame_height) // 4 * 2
+        if cover:
+            filters.append(f"crop={frame_width}:{frame_height}:{x}:{y}:exact=1")
+        else:
+            filters.append(f"pad={frame_width}:{frame_height}:{(frame_width - size[0]) // 4 * 2}:{(frame_height - size[1]) // 4 * 2}:color=black")
+    filters.append(f"setsar={frame_sar.numerator}/{frame_sar.denominator}")
     if pix_fmt := plan.preset["video"].get("pix_fmt"):
         filters.append(f"format={pix_fmt}")
     filters.append(f"setfield={plan.field or 'prog'}")
@@ -346,7 +363,11 @@ def _codec_args(plan: Plan) -> list[str]:
     else:
         args += ["-c:a", f"pcm_s{plan.bits}le", "-ar", str(plan.rate)]
     container = plan.preset["container"]
-    args += ["-timecode", plan.start_tc, "-map_metadata", "-1", "-map_chapters", "-1", "-f", container]
+    args += ["-timecode", plan.start_tc, "-f", container]
+    if not plan.preset.get("preserve_metadata"):
+        args += ["-map_metadata", "-1", "-map_chapters", "-1"]
+    elif container == "mov":
+        args += ["-movflags", "+use_metadata_tags+write_colr"]
     if container == "mp4":
         args += ["-write_tmcd", "1", *(["-movflags", "+faststart"] if plan.preset.get("faststart") else [])]
     return args
@@ -370,6 +391,136 @@ def check_encoder(preset: str | Path) -> None:
     except (OSError, RuntimeError) as exc:
         raise RuntimeError(f"NVENC nicht nutzbar. Prüfe NVIDIA-Treiber und den verwendeten ffmpeg-Build; "
                            f"für CPU-Betrieb das libx264-Preset wählen. {exc}") from exc
+
+
+
+color_options = {"color_space": "-colorspace", "color_primaries": "-color_primaries",
+                 "color_transfer": "-color_trc", "color_range": "-color_range",
+                 "chroma_location": "-chroma_sample_location"}
+
+
+def _color_args(data: dict) -> list[str]:
+    args = []
+    for key, option in color_options.items():
+        value = data.get(key)
+        if value and value not in ("unknown", "unspecified", "reserved"):
+            if key == "color_transfer":
+                value = {"bt470m": "gamma22", "bt470bg": "gamma28"}.get(value, value)
+            args += [option, value]
+    return args
+
+
+def _decoded_frame(path: Path) -> dict:
+    text, _ = _media.run_text("ffprobe", ["-v", "error", "-select_streams", "v:0", "-read_intervals", "%+#1",
+                                       "-show_entries", "frame=interlaced_frame,top_field_first,color_space,color_range,color_transfer,color_primaries",
+                                       "-of", "json", str(path)])
+    frames = json.loads(text).get("frames", [])
+    if not frames:
+        raise ValueError("Erste Bildprüfung: kein decodierbares Bild")
+    return frames[0]
+
+
+def _source_args(source: Source, plan: Plan, inputs: dict) -> list[str]:
+    if not plan.preset.get("preserve_metadata"):
+        return []
+    ref = source.video
+    number = inputs[(id(source), ref.file)]
+    args = ["-r:v", str(source.fps), "-fps_mode:v", "cfr", "-map_metadata", str(number),
+            "-map_metadata:s:v:0", f"{number}:s:v:{ref.ordinal}", "-map_chapters", str(number)]
+    args += _color_args(source.video.data)
+    for index, track in enumerate(plan.tracks):
+        channel = source.channels[track[0] - 1]
+        stream = channel.stream
+        args += [f"-map_metadata:s:a:{index}", f"{inputs[(id(source), stream.file)]}:s:a:{stream.ordinal}"]
+    args += ["-metadata", f"timecode={plan.start_tc}", "-metadata:s:v:0", f"timecode={plan.start_tc}"]
+    return args
+
+
+def check_source_encoder(source: Source, preset: str | Path) -> None:
+    """Probe one generated frame before a Marathon job; unsupported inputs must not be transcoded."""
+    _, values = _presets.load(preset)
+    frame = _frame(source, values, None)
+    if frame[0] % 2 or frame[1] % 2 or min(frame[:2]) < 2:
+        raise ValueError(f"Quellbildgröße {frame[0]}×{frame[1]} für den Master nicht geeignet")
+    if values.get("preserve_metadata") and source.video.data.get("side_data_list"):
+        unsupported = [item.get("side_data_type", "unbekannt") for item in source.video.data["side_data_list"]
+                       if item.get("side_data_type") not in ("SMPTE 12-1 timecode", "S12M Timecode")]
+        if unsupported:
+            raise ValueError(f"Zusatzmetadaten nicht sicher übertragbar: {', '.join(unsupported)}; manuelle Prüfung nötig")
+    if values.get("preserve_metadata"):
+        if source.video.data.get("closed_captions") or source.video.data.get("film_grain"):
+            raise ValueError("Untertitel-/Filmgrain-Zusatzdaten nicht sicher übertragbar; manuelle Prüfung nötig")
+        extra = [stream.get("codec_type") for data in source.probes for stream in data.get("streams", [])
+                 if stream.get("codec_type") not in ("video", "audio")
+                 and stream.get("codec_tag_string") != "tmcd"]
+        if extra:
+            raise ValueError(f"Zusätzliche Quellstreams nicht sicher übertragbar: {', '.join(str(item) for item in extra)}")
+    scan = values["video"]["scan"]
+    field = source.field_order if source.field_order in ("tff", "bff") else None
+    if scan == "interlaced" and not field:
+        raise ValueError("DNxHD-Master benötigt eine eindeutige Feldreihenfolge")
+    if values["video"].get("profile") == "dnxhd" and values["video"].get("bitrate") == "185M" and source.fps != Fraction(25):
+        raise ValueError(f"DNxHD 185x interlaced benötigt 25 Frames/s; Quelle hat {source.fps}. Clip nicht transcodiert")
+    with tempfile.TemporaryDirectory(prefix="transcoder_probe_") as folder:
+        target = Path(folder) / "probe.mov"
+        _media.run_text("ffmpeg", ["-nostdin", "-v", "error", "-f", "lavfi", "-i",
+                                  f"color=c=black:s={frame[0]}x{frame[1]}:r={source.fps}", "-frames:v", "1", "-an",
+                                  "-vf", f"format={values['video']['pix_fmt']},setsar={frame[2]},setfield={field or 'prog'}",
+                                  *_video_codec_args(values["video"], field), *_color_args(source.video.data),
+                                  "-threads:v", "1", "-movflags", "+write_colr", "-f", "mov", str(target)], timeout=30)
+        video = _media.probe(target)["streams"][0]
+        decoded = _decoded_frame(target)
+        changed = [key for key in color_options if source.video.data.get(key) not in (None, "unknown", "unspecified", "reserved")
+                   and (video.get(key) != source.video.data[key]
+                        or key in decoded and decoded[key] != source.video.data[key])]
+        if changed:
+            raise ValueError(f"Quell-Farbangaben mit dem Master-Codec nicht sicher übertragbar: {', '.join(changed)}; Clip nicht transcodiert")
+
+
+def _verify_master(source: Source, plan: Plan) -> None:
+    data = _media.probe(plan.part)
+    streams = data.get("streams", [])
+    video = next((item for item in streams if item.get("codec_type") == "video"), {})
+    audio = [item for item in streams if item.get("codec_type") == "audio"]
+    errors = []
+    expected_profile = {"dnxhr_hqx": "DNXHR HQX", "dnxhd": "DNXHD"}.get(plan.preset["video"]["profile"])
+    if video.get("codec_name") != "dnxhd" or video.get("profile") != expected_profile:
+        errors.append("Video-Codec/Profil")
+    if (video.get("width"), video.get("height")) != plan.frame[:2]:
+        errors.append("Bildgröße")
+    if _media.rate(video.get("avg_frame_rate")) != source.fps:
+        errors.append("Framerate")
+    expected_frames = sum(_segment_frames(segment, source.fps, source) for segment in plan.segments)
+    if int(video.get("nb_frames") or 0) != expected_frames:
+        errors.append("Videolänge/Framezahl")
+    if _media.rate(str(video.get("sample_aspect_ratio", "1:1")).replace(":", "/")) != plan.frame[2]:
+        errors.append("Pixel-Seitenverhältnis")
+    decoded = _decoded_frame(plan.part)
+    actual_order = ("tff" if decoded.get("top_field_first") else "bff") if decoded.get("interlaced_frame") else None
+    if actual_order != plan.field:
+        errors.append("Scan/Feldreihenfolge")
+    if video.get("pix_fmt") != plan.preset["video"].get("pix_fmt"):
+        errors.append("Video-Pixelformat")
+    if len(audio) != len(plan.tracks) or any(item.get("codec_name") != f"pcm_s{plan.bits}le"
+                                           or item.get("channels") != 1
+                                           or int(item.get("sample_rate", 0)) != plan.rate for item in audio):
+        errors.append("Audioformat/Kanäle")
+    tags = [data.get("format", {}).get("tags", {})] + [item.get("tags", {}) for item in streams]
+    codes = [value for tag in tags for key, value in tag.items() if key.casefold() == "timecode"]
+    if not codes or not any(value.replace(";", ":") == plan.start_tc.replace(";", ":") for value in codes):
+        errors.append("Timecode")
+    for key in color_options:
+        expected = source.video.data.get(key)
+        if expected and expected not in ("unknown", "unspecified", "reserved") and (video.get(key) != expected or key in decoded and decoded[key] != expected):
+            errors.append(key)
+    expected_chapters = source.probes[source.video.file].get("chapters", [])
+    actual_chapters = data.get("chapters", [])
+    if len(expected_chapters) != len(actual_chapters) or any(
+            abs(float(old.get(key, 0)) - float(new.get(key, 0))) > 0.001
+            for old, new in zip(expected_chapters, actual_chapters) for key in ("start_time", "end_time")):
+        errors.append("Kapitel")
+    if errors:
+        raise ValueError(f"Master-Nachprüfung fehlgeschlagen: {', '.join(errors)}; Datei nicht freigegeben")
 
 
 def _permanent_error(message: str) -> bool:
@@ -404,7 +555,7 @@ def build(source: Source, plans: list[Plan]) -> tuple[list[str], str]:
         else:
             video_label, audio_labels = parts[0]
         outputs += ["-map", video_label, *(option for label in audio_labels for option in ("-map", label)),
-                    *_codec_args(plan), str(plan.part)]
+                    *_codec_args(plan), *_source_args(source, plan, inputs), str(plan.part)]
     return args + ["@graph"] + outputs, graph.text()
 
 
@@ -469,10 +620,12 @@ def run(source: Source, plans: list[Plan], on_progress: Callable[[dict], None]) 
     failed = {}
     for index, plan in enumerate(plans):
         try:
+            if plan.preset.get("preserve_metadata"):
+                _verify_master(source, plan)
             if plan.target.exists():
                 raise FileExistsError(f"Zieldatei inzwischen vorhanden: {plan.target}")
             os.replace(plan.part, plan.target)
-        except OSError as exc:
+        except (OSError, RuntimeError, ValueError) as exc:
             _remove([plan.part])
             failed[index] = str(exc)
     return failed

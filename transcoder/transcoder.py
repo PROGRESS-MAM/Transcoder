@@ -10,7 +10,7 @@ from ._source import Source, open_source
 
 # --------- CONFIG ---------
 app_name = "Transcoder"
-app_version = "0.2.0"
+app_version = "0.3.0"
 
 
 # --------- TYPES ---------

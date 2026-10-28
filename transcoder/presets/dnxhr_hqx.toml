@@ -1,14 +1,17 @@
 container = "mov"
+preserve_metadata = true
 
 [video]
 codec   = "dnxhd"
 profile = "dnxhr_hqx"
 pix_fmt = "yuv422p10le"
-frame   = "raster"
-rasters = ["1920x1080", "3840x2160", "2048x1080", "1998x1080", "2048x858", "4096x2160", "3996x2160", "4096x1716"]
+frame   = "source"
 scan    = "source"
+fit     = "cover"
+color   = "source"
 
 [audio]
-codec     = "pcm"
-bit_depth = "source"
-layout    = "tracks"
+codec       = "pcm"
+bit_depth   = 24
+sample_rate = 48000
+layout      = "tracks"
