@@ -108,7 +108,7 @@ def _bits(source: Source, preset: dict) -> int:
 
 def _segments(source: Source, merge, frame: tuple[int, int, Fraction], exact: bool,
               errors: list[tuple[str, str]], cache: dict) -> list[tuple]:
-    from .transcoder import SOURCE, _Black
+    from .transcoder import SOURCE, _Black, _Canvas
     items = list(merge) or [SOURCE]
     if items.count(SOURCE) != 1:
         errors.append(("merge", "merge braucht SOURCE genau einmal"))
@@ -119,8 +119,9 @@ def _segments(source: Source, merge, frame: tuple[int, int, Fraction], exact: bo
             segments.append(("source",))
         elif isinstance(item, _Black):
             segments.append(("black", item.seconds))
-        elif isinstance(item, (str, Path)):
-            path = Path(item)
+        elif isinstance(item, (str, Path, _Canvas)):
+            canvas = item if isinstance(item, _Canvas) else None
+            path = canvas.file if canvas else Path(item)
             try:
                 segment = cache.setdefault(path.resolve(), open_source([path], None))
             except (OSError, RuntimeError, ValueError) as exc:
@@ -130,10 +131,14 @@ def _segments(source: Source, merge, frame: tuple[int, int, Fraction], exact: bo
                 errors.append(("merge", f"{path.name}: kein Video"))
             elif segment.fps != source.fps:
                 errors.append(("merge", f"{path.name}: {float(segment.fps or 0):g} fps, Source {float(source.fps):g} fps"))
-            elif exact and (segment.width, segment.height) != frame[:2]:
+            elif canvas and (canvas.width, canvas.height) != frame[:2]:
+                errors.append(("merge", f"{path.name}: Canvas {canvas.width}×{canvas.height}, Output {frame[0]}×{frame[1]}"))
+            elif canvas and (segment.width > canvas.width or segment.height > canvas.height):
+                errors.append(("merge", f"{path.name}: {segment.width}×{segment.height} passt nicht ohne Beschnitt auf {canvas.width}×{canvas.height}"))
+            elif not canvas and exact and (segment.width, segment.height) != frame[:2]:
                 errors.append(("merge", f"{path.name}: {segment.width}×{segment.height}, Output {frame[0]}×{frame[1]}"))
             else:
-                segments.append(("file", segment))
+                segments.append(("canvas", segment, canvas.width, canvas.height) if canvas else ("file", segment))
         else:
             errors.append(("merge", f"unbekanntes Segment {item!r}"))
     return segments
@@ -142,7 +147,7 @@ def _segments(source: Source, merge, frame: tuple[int, int, Fraction], exact: bo
 def _segment_frames(segment: tuple, fps: Fraction, source: Source) -> int:
     if segment[0] == "black":
         return _media.frame_count(segment[1], fps)
-    return (segment[1] if segment[0] == "file" else source).video_frames
+    return (segment[1] if segment[0] in ("file", "canvas") else source).video_frames
 
 
 def _start_tc(source: Source, code, segments: list[tuple]) -> str:
@@ -300,17 +305,22 @@ def _video(graph: _Graph, plan: Plan, segment: tuple, inputs: dict, source: Sour
                    f"trim=end_frame={_media.frame_count(segment[1], fps)}",
                    *_picture(plan, frame_width, frame_height, frame_sar, None, False)]
         return graph.add("", ",".join(filters + ["setpts=PTS-STARTPTS"]))
-    owner = segment[1] if segment[0] == "file" else source
+    owner = segment[1] if segment[0] in ("file", "canvas") else source
     pad = f"{inputs[(id(owner), owner.video.file)]}:v:{owner.video.ordinal}"
-    crop, deinterlace = (plan.crop, plan.deinterlace) if segment[0] == "source" else (None, False)
-    filters = _picture(plan, owner.width, owner.height, owner.sar, crop, deinterlace, owner.field_order)
+    if segment[0] == "canvas":
+        width, height = segment[2:4]
+        filters = [f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black",
+                   *_picture(plan, width, height, plan.frame[2], None, False, owner.field_order)]
+    else:
+        crop, deinterlace = (plan.crop, plan.deinterlace) if segment[0] == "source" else (None, False)
+        filters = _picture(plan, owner.width, owner.height, owner.sar, crop, deinterlace, owner.field_order)
     return graph.add(graph.use(pad), ",".join(filters + (["setpts=PTS-STARTPTS"] if merged else [])))
 
 
 def _audio(graph: _Graph, plan: Plan, segment: tuple, inputs: dict, source: Source, merged: bool) -> list[str]:
     duration = _segment_frames(segment, source.fps, source) / float(source.fps)
     tail = f",apad,atrim=duration={duration:.6f},asetpts=PTS-STARTPTS" if merged else ""
-    owner = segment[1] if segment[0] == "file" else source if segment[0] == "source" else None
+    owner = segment[1] if segment[0] in ("file", "canvas") else source if segment[0] == "source" else None
     labels = []
     for track_number, track in enumerate(plan.tracks, 1):
         if owner is source:
@@ -535,7 +545,7 @@ def build(source: Source, plans: list[Plan]) -> tuple[list[str], str]:
     """(input and output arguments, filter graph) for all plans in one ffmpeg run."""
     inputs, args = {}, []
     owners = [source] + list({id(segment[1]): segment[1] for plan in plans for segment in plan.segments
-                              if segment[0] == "file"}.values())
+                              if segment[0] in ("file", "canvas")}.values())
     for owner in owners:
         for number, path in enumerate(owner.files):
             inputs[(id(owner), number)] = len(inputs)

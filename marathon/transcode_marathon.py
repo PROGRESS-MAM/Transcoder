@@ -161,20 +161,29 @@ def _plate_format(path: Path) -> tuple | None:
     return _plates[key]
 
 
-def _plate(clips: list[str], wanted: tuple) -> Path | str:
-    """The one FFE plate with size and fps of the source, or the reason for a manual check."""
-    found = []
+def _plate(clips: list[str], wanted: tuple) -> tuple[Path, bool] | str:
+    """The matching FFE plate, or the HD fallback for FullHD sources."""
+    found, fallback = [], []
     for path in map(adapter.share_path, clips):
         try:
-            if _plate_format(path) == wanted:
+            plate_format = _plate_format(path)
+            if plate_format == wanted:
                 found.append(path)
+            elif plate_format and path.name.casefold() == "hd_1_66.mov":
+                fallback.append(path)
         except (OSError, RuntimeError, ValueError) as exc:
             adapter.log(f"FFE-Tafel nicht lesbar: {_short(path)}: {exc}")
     if len(found) == 1:
-        return found[0]
+        return found[0], False
     text = f"{wanted[0]}×{wanted[1]} bei {_fps(wanted[2])} fps"
-    return f"mehrere FFE-Tafeln mit {text}: {', '.join(path.name for path in found)}" if found else \
-        f"keine FFE-Tafel mit {text}"
+    if len(found) > 1:
+        return f"mehrere FFE-Tafeln mit {text}: {', '.join(path.name for path in found)}"
+    if wanted[:2] == (1920, 1080):
+        if len(fallback) == 1:
+            return fallback[0], True
+        if len(fallback) > 1:
+            return f"mehrere FFE-Fallback-Tafeln HD_1_66.mov: {', '.join(path.name for path in fallback)}"
+    return f"keine FFE-Tafel mit {text}"
 
 
 # --------- FUNC RESULT ---------
@@ -257,11 +266,13 @@ def run_job(job: dict, output_folder: Path, log_path: Path) -> adapter.JobReport
         return _manual(["Analyse audio: Source hat keinen Ton."], _name(proxy_preset))
     merge, code = [], None
     if ffe:
-        plate = _plate(job["ffe_reference_clips"], _format(reports["streams"]))
-        if isinstance(plate, str):
-            return _manual([plate], _name(proxy_preset))
+        selected = _plate(job["ffe_reference_clips"], _format(reports["streams"]))
+        if isinstance(selected, str):
+            return _manual([selected], _name(proxy_preset))
+        plate, fallback = selected
         adapter.log(f"FFE-Tafel: {_short(plate)}")
-        merge, code = [plate, transcoder.black(ffe_black_seconds), transcoder.SOURCE], transcoder.timecode(anchor=transcoder.SOURCE)
+        segment = transcoder.centered(plate, 1920, 1080) if fallback else plate
+        merge, code = [segment, transcoder.black(ffe_black_seconds), transcoder.SOURCE], transcoder.timecode(anchor=transcoder.SOURCE)
     reports.update(transcoder.analyse(source, "audio", settings, _console))
     if "error" in reports["audio"]:
         return _manual([f"Analyse audio: {reports['audio']['error']}"], _name(proxy_preset))

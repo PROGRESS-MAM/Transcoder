@@ -41,6 +41,13 @@ class _Black:
 
 
 @dataclass(frozen=True)
+class _Canvas:
+    file: Path
+    width: int
+    height: int
+
+
+@dataclass(frozen=True)
 class _Segment:
     name: str
 
@@ -194,6 +201,13 @@ def black(seconds: float) -> _Black:
     return _Black(float(seconds))
 
 
+def centered(file: str | Path, width: int, height: int) -> _Canvas:
+    """Segment: center a picture at its original size on a black frame."""
+    if any(not isinstance(value, int) or isinstance(value, bool) or value < 2 for value in (width, height)):
+        raise ValueError(f"centered braucht Bildgrößen ab 2×2, erhalten {(width, height)}.")
+    return _Canvas(Path(file), width, height)
+
+
 def timecode(start: str | None = None, shift: str | None = None, anchor: _Segment | None = None) -> _Timecode:
     """Start timecode of an output: fixed start, start of the source plus shift, or anchor=SOURCE.
 
@@ -214,8 +228,8 @@ def output(preset: str | Path, file: str | Path, fixes: Iterable[_Fix] = (), mod
            merge: Iterable = (), timecode: _Timecode | None = None) -> _Output:
     """Description of one output file; render() creates it.
 
-    preset: name in transcoder/presets or path to a TOML file. merge: segments in order (file paths, black(),
-    SOURCE); without merge only the source. A change in modify replaces the fix of the same kind.
+    preset: name in transcoder/presets or path to a TOML file. merge: segments in order (file paths, centered(),
+    black(), SOURCE); without merge only the source. A change in modify replaces the fix of the same kind.
     """
     fixes, modify, merge = tuple(fixes), tuple(modify), tuple(merge)
     if bad := [item for item in fixes if not isinstance(item, _Fix)]:
@@ -230,7 +244,8 @@ def output(preset: str | Path, file: str | Path, fixes: Iterable[_Fix] = (), mod
 # --------- FUNC RENDER ---------
 def _segment_texts(plan: _render.Plan) -> list[str]:
     names = {"source": lambda segment: "SOURCE", "black": lambda segment: f"black({segment[1]:g})",
-             "file": lambda segment: str(segment[1].files[0])}
+             "file": lambda segment: str(segment[1].files[0]),
+             "canvas": lambda segment: str(segment[1].files[0])}
     return [names[segment[0]](segment) for segment in plan.segments]
 
 
