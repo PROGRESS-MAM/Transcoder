@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+import codecs
+import io
 import json
+import re
 import shutil
 import subprocess
+import threading
+import time
 from datetime import datetime, timezone
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
@@ -138,6 +144,206 @@ def _run(
     return result
 
 
+class _JsonArrayCounter:
+    """Count complete object entries in one named top-level JSON array."""
+
+    def __init__(self, array_name: str) -> None:
+        self._pattern = re.compile(r'"' + re.escape(array_name) + r'"\s*:\s*\[')
+        self._prefix = ""
+        self._started = False
+        self._finished = False
+        self._in_string = False
+        self._escaped = False
+        self._object_depth = 0
+        self.count = 0
+
+    def feed(self, text: str) -> int:
+        before = self.count
+        if self._finished:
+            return 0
+        if not self._started:
+            self._prefix += text
+            match = self._pattern.search(self._prefix)
+            if not match:
+                return 0
+            text = self._prefix[match.end():]
+            self._prefix = ""
+            self._started = True
+
+        for char in text:
+            if self._in_string:
+                if self._escaped:
+                    self._escaped = False
+                elif char == "\\":
+                    self._escaped = True
+                elif char == '"':
+                    self._in_string = False
+                continue
+            if char == '"':
+                self._in_string = True
+            elif char == "{":
+                self._object_depth += 1
+            elif char == "}" and self._object_depth:
+                self._object_depth -= 1
+                if self._object_depth == 0:
+                    self.count += 1
+            elif char == "]" and self._object_depth == 0:
+                self._finished = True
+                break
+        return self.count - before
+
+
+def _numeric_count(value: Any) -> int | None:
+    try:
+        count = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return count if count > 0 else None
+
+
+def _number(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if number > 0 else None
+
+
+def _frame_rate(stream: dict[str, Any]) -> float | None:
+    for field in ("avg_frame_rate", "r_frame_rate"):
+        value = stream.get(field)
+        if not value or value in ("N/A", "unknown"):
+            continue
+        try:
+            rate = float(Fraction(str(value)))
+        except (ValueError, ZeroDivisionError, TypeError):
+            continue
+        if rate > 0:
+            return rate
+    return None
+
+
+def _progress_total(phase: str, inventory: dict[str, Any]) -> tuple[int | None, bool]:
+    streams = [
+        stream
+        for stream in inventory.get("streams", [])
+        if isinstance(stream, dict) and stream.get("codec_type") == "video"
+    ]
+    if not streams:
+        return None, False
+
+    count_field = "nb_read_packets" if phase == "packets" else "nb_read_frames"
+    fallback_field = "nb_frames" if phase == "frames" else None
+    counts: list[int] = []
+    can_use_counts = True
+    estimates: list[int] = []
+    format_data = inventory.get("format", {})
+    format_duration = _number(format_data.get("duration")) if isinstance(format_data, dict) else None
+
+    for stream in streams:
+        count = _numeric_count(stream.get(count_field))
+        if count is None and fallback_field:
+            count = _numeric_count(stream.get(fallback_field))
+        if count is not None:
+            counts.append(count)
+            continue
+
+        can_use_counts = False
+        duration = _number(stream.get("duration")) or format_duration
+        rate = _frame_rate(stream)
+        if duration is None or rate is None:
+            return None, False
+        estimates.append(max(1, int(duration * rate + 0.5)))
+
+    if can_use_counts:
+        return sum(counts), False
+    return sum(counts + estimates), True
+
+
+def _run_json_stream(
+    command_name: str,
+    args: list[str],
+    commands: dict[str, list[str]],
+    diagnostics: dict[str, dict[str, Any]],
+    phase: str,
+    total: int | None,
+    estimated: bool,
+    progress: Any = None,
+) -> dict[str, Any]:
+    commands[command_name] = args
+    if progress:
+        progress(phase, 0, total, estimated)
+    try:
+        process = subprocess.Popen(
+            args,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except OSError as exc:
+        raise ProbeError(f"Could not run ffprobe: {exc}") from None
+
+    stderr_parts: list[bytes] = []
+
+    def read_stderr() -> None:
+        assert process.stderr is not None
+        stderr_parts.append(process.stderr.read())
+
+    stderr_reader = threading.Thread(target=read_stderr, daemon=True)
+    stderr_reader.start()
+    stdout_parts: list[str] = []
+    counter = _JsonArrayCounter(phase)
+    last_update = time.monotonic()
+    try:
+        assert process.stdout is not None
+        decoder = io.IncrementalNewlineDecoder(
+            codecs.getincrementaldecoder("utf-8")("replace"), translate=True
+        )
+        while True:
+            chunk = process.stdout.read1(65536)
+            if not chunk:
+                break
+            text = decoder.decode(chunk)
+            if text:
+                stdout_parts.append(text)
+                old_count = counter.count
+                counter.feed(text)
+                now = time.monotonic()
+                if progress and counter.count != old_count and now - last_update >= 0.25:
+                    progress(phase, counter.count, total, estimated)
+                    last_update = now
+        tail = decoder.decode(b"", final=True)
+        if tail:
+            stdout_parts.append(tail)
+            counter.feed(tail)
+        return_code = process.wait()
+        stderr_reader.join()
+    except BaseException:
+        process.kill()
+        process.wait()
+        stderr_reader.join()
+        raise
+
+    stdout = "".join(stdout_parts)
+    stderr = b"".join(stderr_parts).decode("utf-8", errors="replace")
+    stderr = stderr.replace("\r\n", "\n").replace("\r", "\n")
+    diagnostics[command_name] = _command_diagnostics(stderr)
+    if return_code != 0:
+        detail = stderr.strip() or f"exit code {return_code}"
+        if len(detail) > 1000:
+            detail = detail[:997] + "..."
+        raise ProbeError(f"ffprobe failed: {detail}")
+    if progress:
+        progress(phase, counter.count, total, estimated)
+    try:
+        payload = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        raise ProbeError(f"ffprobe returned invalid JSON for {command_name}: {exc.msg}") from None
+    if not isinstance(payload, dict):
+        raise ProbeError(f"ffprobe returned an invalid response for {command_name}")
+    return payload
+
+
 def _run_json(
     command_name: str,
     args: list[str],
@@ -238,7 +444,7 @@ def _inventory(payload: dict[str, Any], frames: list[dict[str, Any]]) -> dict[st
     }
 
 
-def collect_clip(path: Path) -> dict[str, Any]:
+def collect_clip(path: Path, progress: Any = None) -> dict[str, Any]:
     """Read a complete clip's inventory, video packets, and decoded frames."""
     source_path, file_size = _readable_path(Path(path))
     ffprobe = _resolve_tool("ffprobe")
@@ -272,7 +478,8 @@ def collect_clip(path: Path) -> dict[str, Any]:
     if not inventory_data.get("format") and not inventory_data.get("streams"):
         raise ProbeError(f"ffprobe found no media streams in '{source_path}'.")
 
-    packet_data = _run_json(
+    packet_total, packet_estimated = _progress_total("packets", inventory_data)
+    packet_data = _run_json_stream(
         "packets",
         [
             ffprobe,
@@ -289,6 +496,10 @@ def collect_clip(path: Path) -> dict[str, Any]:
         ],
         commands,
         diagnostics,
+        "packets",
+        packet_total,
+        packet_estimated,
+        progress,
     )
     streams_by_index = {
         stream.get("index"): stream
@@ -310,7 +521,8 @@ def collect_clip(path: Path) -> dict[str, Any]:
             }
         )
 
-    frame_data = _run_json(
+    frame_total, frame_estimated = _progress_total("frames", inventory_data)
+    frame_data = _run_json_stream(
         "frames",
         [
             ffprobe,
@@ -327,6 +539,10 @@ def collect_clip(path: Path) -> dict[str, Any]:
         ],
         commands,
         diagnostics,
+        "frames",
+        frame_total,
+        frame_estimated,
+        progress,
     )
     frames: list[dict[str, Any]] = []
     for frame in frame_data.get("frames", []):

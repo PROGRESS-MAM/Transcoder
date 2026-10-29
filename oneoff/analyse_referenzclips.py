@@ -14,14 +14,15 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from oneoff.analysis.evaluate import REFERENCE_LABELS, evaluate_clip
 from oneoff.analysis.report import write_outputs
+from oneoff.analysis.progress import ProgressDisplay
 
 CLIP_NAMES = tuple(REFERENCE_LABELS)
 
 
-def _collector(path):
+def _collector(path, progress=None):
     from oneoff.analysis.probe import collect_clip
 
-    return collect_clip(path)
+    return collect_clip(path, progress=progress)
 
 
 def _create_run_directory(output_root, timestamp):
@@ -68,12 +69,29 @@ def main(argv=None, collector=None):
         print("Missing required clip(s): " + ", ".join(missing), file=sys.stderr)
         return 2
 
-    clip_collector = collector or _collector
+    progress = ProgressDisplay() if collector is None else None
     raw_clips = []
-    for clip_path in clip_paths:
+    for clip_index, clip_path in enumerate(clip_paths, start=1):
         try:
-            raw_clips.append(clip_collector(clip_path))
+            if collector is None:
+                def update(phase, current, total, estimated=False):
+                    if progress:
+                        progress.update(
+                            clip_index,
+                            len(clip_paths),
+                            clip_path.name,
+                            phase,
+                            current,
+                            total,
+                            estimated,
+                        )
+
+                raw_clips.append(_collector(clip_path, progress=update))
+            else:
+                raw_clips.append(collector(clip_path))
         except Exception as error:
+            if progress:
+                progress.finish_line()
             print(f"Could not analyse {clip_path.name}: {error}", file=sys.stderr)
             return 1
 
@@ -84,15 +102,36 @@ def main(argv=None, collector=None):
         print(f"Could not create analysis output folder: {error}", file=sys.stderr)
         return 1
     try:
-        evaluations = [evaluate_clip(raw) for raw in raw_clips]
+        if progress:
+            progress.update(1, len(raw_clips), CLIP_NAMES[0], "evaluation", 0, len(raw_clips))
+        evaluations = []
+        for clip_index, raw in enumerate(raw_clips, start=1):
+            evaluations.append(evaluate_clip(raw))
+            if progress:
+                progress.update(
+                    clip_index,
+                    len(raw_clips),
+                    CLIP_NAMES[clip_index - 1],
+                    "evaluation",
+                    clip_index,
+                    len(raw_clips),
+                )
+        if progress:
+            progress.update(len(raw_clips), len(raw_clips), CLIP_NAMES[-1], "report", 0, 1)
         write_outputs(run_dir, raw_clips, evaluations, generated_at)
+        if progress:
+            progress.update(len(raw_clips), len(raw_clips), CLIP_NAMES[-1], "report", 1, 1)
     except Exception as error:
         for child in run_dir.iterdir():
             if child.is_file():
                 child.unlink()
         run_dir.rmdir()
+        if progress:
+            progress.finish_line()
         print(f"Could not write analysis report: {error}", file=sys.stderr)
         return 1
+    if progress:
+        progress.finish_line()
     print(f"Analysis complete: {run_dir}")
     return 0
 

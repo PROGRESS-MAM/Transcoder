@@ -57,8 +57,18 @@ def test_collects_complete_clip_data(tmp_path: Path, b_frames: int, has_b_frames
     _make_clip(clip, b_frames)
     original = clip.read_bytes()
 
-    result = collect_clip(clip)
+    original_result = collect_clip(clip)
+    updates = []
+    result = collect_clip(clip, progress=lambda *update: updates.append(update))
 
+    assert {key: value for key, value in result.items() if key != "analysed_at"} == {
+        key: value for key, value in original_result.items() if key != "analysed_at"
+    }
+    assert {update[0] for update in updates} == {"packets", "frames"}
+    assert all(len(update) == 4 for update in updates)
+    final_counts = {phase: current for phase, current, _, _ in updates}
+    assert final_counts["packets"] == len(result["packets"])
+    assert final_counts["frames"] == len(result["frames"])
     assert set(result) == {
         "file",
         "analysed_at",
