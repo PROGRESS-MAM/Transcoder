@@ -25,7 +25,7 @@ from typing import Iterator
 app_name = "pruefe_zeitstempel"
 app_version = "1.0.0"
 
-folder = Path(r"C:\Pfad\zum\10-Mbit-Proxy-Ordner")  # <- hier den Proxy-Ordner eintragen
+folder = Path(r"\\10.0.77.102\FiMu 1.5 Mbit Proxy")  # <- hier den Proxy-Ordner eintragen
 recursive = False
 report_dir = Path(__file__).resolve().parent / "reports"
 ffprobe_path = "ffprobe"
