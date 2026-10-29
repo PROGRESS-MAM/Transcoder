@@ -63,6 +63,7 @@ def test_collects_complete_clip_data(tmp_path: Path, b_frames: int, has_b_frames
         "file",
         "analysed_at",
         "tools",
+        "tool_paths",
         "commands",
         "diagnostics",
         "inventory",
@@ -76,6 +77,7 @@ def test_collects_complete_clip_data(tmp_path: Path, b_frames: int, has_b_frames
     }
     assert result["tools"]["ffprobe"].startswith("ffprobe version")
     assert result["tools"]["ffmpeg"].startswith("ffmpeg version")
+    assert result["tool_paths"] == {"ffprobe": FFPROBE, "ffmpeg": FFMPEG}
     assert len(result["packets"]) == 12
     assert len(result["frames"]) == 12
     assert result["inventory"]["frame_counts"]["decoded_video_total"] == 12

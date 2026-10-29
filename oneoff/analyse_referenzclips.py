@@ -5,9 +5,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 import sys
 
-PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+CLIP_FOLDER = Path(r"\\10.0.77.102\FiMu 1.5 Mbit Proxy")
+OUTPUT_FOLDER = PROJECT_ROOT / "oneoff" / "analysis_reports"
+
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from oneoff.analysis.evaluate import REFERENCE_LABELS, evaluate_clip
 from oneoff.analysis.report import write_outputs
@@ -37,15 +40,30 @@ def _create_run_directory(output_root, timestamp):
 
 def main(argv=None, collector=None):
     parser = argparse.ArgumentParser(description="Read-only analysis of the three reference clips.")
-    parser.add_argument("clip_folder", type=Path, help="folder containing the original reference clips")
-    parser.add_argument("--output-folder", type=Path, help="base folder for timestamped report runs")
+    parser.add_argument(
+        "clip_folder",
+        nargs="?",
+        type=Path,
+        default=CLIP_FOLDER,
+        help="folder containing the original reference clips",
+    )
+    parser.add_argument(
+        "--output-folder",
+        type=Path,
+        default=OUTPUT_FOLDER,
+        help="base folder for timestamped report runs",
+    )
     args = parser.parse_args(argv)
 
-    if not args.clip_folder.is_dir():
-        print(f"Clip folder does not exist or is not a directory: {args.clip_folder}", file=sys.stderr)
+    try:
+        if not args.clip_folder.is_dir():
+            print(f"Clip folder is unavailable or is not a directory: {args.clip_folder}", file=sys.stderr)
+            return 2
+        clip_paths = [args.clip_folder / name for name in CLIP_NAMES]
+        missing = [path.name for path in clip_paths if not path.is_file()]
+    except OSError:
+        print(f"Clip folder is unavailable or not readable: {args.clip_folder}", file=sys.stderr)
         return 2
-    clip_paths = [args.clip_folder / name for name in CLIP_NAMES]
-    missing = [path.name for path in clip_paths if not path.is_file()]
     if missing:
         print("Missing required clip(s): " + ", ".join(missing), file=sys.stderr)
         return 2
@@ -60,9 +78,8 @@ def main(argv=None, collector=None):
             return 1
 
     generated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    output_root = args.output_folder or args.clip_folder / "analysis_reports"
     try:
-        run_dir = _create_run_directory(output_root, datetime.now(timezone.utc))
+        run_dir = _create_run_directory(args.output_folder, datetime.now(timezone.utc))
     except OSError as error:
         print(f"Could not create analysis output folder: {error}", file=sys.stderr)
         return 1

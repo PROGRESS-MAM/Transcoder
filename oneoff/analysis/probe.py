@@ -10,8 +10,23 @@ from pathlib import Path
 from typing import Any
 
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
 class ProbeError(RuntimeError):
     """Raised when a clip cannot be safely inspected."""
+
+
+def _resolve_tool(tool_name: str, repo_root: Path | None = None) -> str:
+    root = Path(repo_root) if repo_root is not None else REPO_ROOT
+    bundled_path = root / "res" / f"{tool_name}.exe"
+    if bundled_path.is_file():
+        return str(bundled_path.resolve())
+
+    path_tool = shutil.which(tool_name)
+    if path_tool:
+        return path_tool
+    raise ProbeError(f"Required tool '{tool_name}' was not found in res/ or on PATH.")
 
 
 _FORMAT_FIELDS = (
@@ -226,12 +241,8 @@ def _inventory(payload: dict[str, Any], frames: list[dict[str, Any]]) -> dict[st
 def collect_clip(path: Path) -> dict[str, Any]:
     """Read a complete clip's inventory, video packets, and decoded frames."""
     source_path, file_size = _readable_path(Path(path))
-    ffprobe = shutil.which("ffprobe")
-    if not ffprobe:
-        raise ProbeError("Required tool 'ffprobe' was not found on PATH.")
-    ffmpeg = shutil.which("ffmpeg")
-    if not ffmpeg:
-        raise ProbeError("Required tool 'ffmpeg' was not found on PATH.")
+    ffprobe = _resolve_tool("ffprobe")
+    ffmpeg = _resolve_tool("ffmpeg")
 
     commands: dict[str, list[str]] = {}
     diagnostics: dict[str, dict[str, Any]] = {}
@@ -345,6 +356,7 @@ def collect_clip(path: Path) -> dict[str, Any]:
             "ffprobe": ffprobe_version_output.splitlines()[0] if ffprobe_version_output else "unknown",
             "ffmpeg": ffmpeg_version_output.splitlines()[0] if ffmpeg_version_output else "unknown",
         },
+        "tool_paths": {"ffprobe": ffprobe, "ffmpeg": ffmpeg},
         "commands": commands,
         "diagnostics": diagnostics,
         "inventory": _inventory(inventory_data, frames),

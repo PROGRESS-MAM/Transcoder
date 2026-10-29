@@ -228,3 +228,26 @@ def test_collected_file_metadata_is_consumed(tmp_path):
     assert report_path.name == "report.md"
     assert [path.name for path in json_paths] == ["58238241.json"]
     assert json.loads(json_paths[0].read_text())["file"] == raw["file"]
+
+
+def test_cli_no_arguments_uses_configured_paths(tmp_path, monkeypatch, capsys):
+    clip_dir = tmp_path / "clips with spaces"
+    clip_dir.mkdir()
+    for name in analyse_referenzclips.CLIP_NAMES:
+        (clip_dir / name).write_bytes(b"fixture")
+    output_dir = tmp_path / "repo" / "oneoff" / "analysis_reports"
+    monkeypatch.setattr(analyse_referenzclips, "CLIP_FOLDER", clip_dir)
+    monkeypatch.setattr(analyse_referenzclips, "OUTPUT_FOLDER", output_dir)
+    monkeypatch.chdir(tmp_path)
+
+    fixtures = {
+        "58238241.mp4": error_clip("58238241.mp4"),
+        "58238527.mp4": error_clip("58238527.mp4"),
+        "53287289.mp4": clean_clip("53287289.mp4"),
+    }
+    assert analyse_referenzclips.main([], lambda path: copy.deepcopy(fixtures[path.name])) == 0
+
+    message = capsys.readouterr().out.strip()
+    run_dir = Path(message.removeprefix("Analysis complete: "))
+    assert run_dir.is_relative_to(output_dir)
+    assert (run_dir / "report.md").is_file()
