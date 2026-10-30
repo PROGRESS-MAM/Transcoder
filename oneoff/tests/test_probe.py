@@ -1,106 +1,127 @@
+from __future__ import annotations
+
 import json
-import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
 
-from oneoff.analysis import ProbeError, collect_clip
+from oneoff.analysis import collect_clip
+from oneoff.analysis import probe
 
 
-FFMPEG = shutil.which("ffmpeg")
-FFPROBE = shutil.which("ffprobe")
-pytestmark = pytest.mark.skipif(
-    not FFMPEG or not FFPROBE, reason="ffmpeg and ffprobe are required for generated clips"
-)
+@pytest.fixture
+def clip(tmp_path: Path) -> Path:
+    path = tmp_path / "sample.mp4"
+    path.write_bytes(b"fixture")
+    return path
 
 
-def _make_clip(path: Path, b_frames: int) -> None:
-    subprocess.run(
-        [
-            FFMPEG,
-            "-v",
-            "error",
-            "-f",
-            "lavfi",
-            "-i",
-            "testsrc=size=64x64:rate=12",
-            "-f",
-            "lavfi",
-            "-i",
-            "sine=frequency=1000:sample_rate=48000",
-            "-t",
-            "1",
-            "-c:v",
-            "libx264",
-            "-pix_fmt",
-            "yuv420p",
-            "-g",
-            "12",
-            "-bf",
-            str(b_frames),
-            "-c:a",
-            "aac",
-            "-shortest",
-            str(path),
-        ],
-        check=True,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+def _completed(stdout: str = "{}", returncode: int = 0, stderr: str = "") -> subprocess.CompletedProcess[str]:
+    return subprocess.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr=stderr)
 
 
-@pytest.mark.parametrize("b_frames, has_b_frames", [(2, True), (0, False)])
-def test_collects_complete_clip_data(tmp_path: Path, b_frames: int, has_b_frames: bool) -> None:
-    clip = tmp_path / f"clip-b{b_frames}.mp4"
-    _make_clip(clip, b_frames)
-    original = clip.read_bytes()
+def test_collects_metadata_packets_and_decoded_frames(monkeypatch: pytest.MonkeyPatch, clip: Path) -> None:
+    monkeypatch.setattr(probe, "_resolve_ffprobe", lambda: "/tools/ffprobe")
+    responses = [
+        _completed("ffprobe version 7.0\n"),
+        _completed(json.dumps({"format": {"duration": "1"}, "streams": [{"codec_type": "video", "r_frame_rate": "25/1"}], "chapters": []})),
+        _completed(json.dumps({"packets": [{"pts": 10, "dts": 9, "pos": "100", "flags": "K_"}]})),
+        _completed(json.dumps({"frames": [{"pts": 10, "best_effort_timestamp": 11, "pict_type": "I"}]})),
+    ]
+    calls: list[list[str]] = []
 
-    original_result = collect_clip(clip)
-    updates = []
-    result = collect_clip(clip, progress=lambda *update: updates.append(update))
+    def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        return responses.pop(0)
 
-    assert {key: value for key, value in result.items() if key != "analysed_at"} == {
-        key: value for key, value in original_result.items() if key != "analysed_at"
-    }
-    assert {update[0] for update in updates} == {"packets", "frames"}
-    assert all(len(update) == 4 for update in updates)
-    final_counts = {phase: current for phase, current, _, _ in updates}
-    assert final_counts["packets"] == len(result["packets"])
-    assert final_counts["frames"] == len(result["frames"])
-    assert set(result) == {
-        "file",
-        "analysed_at",
-        "tools",
-        "tool_paths",
-        "commands",
-        "diagnostics",
-        "inventory",
-        "packets",
-        "frames",
-    }
-    assert result["file"] == {
-        "name": clip.name,
-        "abs_path": str(clip.resolve()),
-        "size": len(original),
-    }
-    assert result["tools"]["ffprobe"].startswith("ffprobe version")
-    assert result["tools"]["ffmpeg"].startswith("ffmpeg version")
-    assert result["tool_paths"] == {"ffprobe": FFPROBE, "ffmpeg": FFMPEG}
-    assert len(result["packets"]) == 12
-    assert len(result["frames"]) == 12
-    assert result["inventory"]["frame_counts"]["decoded_video_total"] == 12
-    assert any(frame["codec_type"] == "audio" for frame in result["inventory"]["streams"])
-    assert any(frame["pict_type"] == "B" for frame in result["frames"]) is has_b_frames
-    assert all("time_base" in packet for packet in result["packets"])
-    assert all("best_effort_timestamp" in frame for frame in result["frames"])
-    assert set(result["commands"]) == set(result["diagnostics"])
-    json.dumps(result)
-    assert clip.read_bytes() == original
+    monkeypatch.setattr(probe.subprocess, "run", run)
+    raw = collect_clip(clip)
+
+    assert raw["status"] == "complete"
+    assert raw["metadata"]["streams"][0]["r_frame_rate"] == "25/1"
+    assert raw["packets"][0]["pts"] == 10
+    assert raw["decoder_frames"][0]["best_effort_timestamp"] == 11
+    assert raw["tool_version"] == "ffprobe version 7.0"
+    assert len(calls) == 4
+    json.dumps(raw)
 
 
-def test_unreadable_path_has_clear_error(tmp_path: Path) -> None:
-    missing = tmp_path / "missing.mp4"
-    with pytest.raises(ProbeError, match="Cannot read media file"):
-        collect_clip(missing)
+def test_missing_ffprobe_returns_clear_error(monkeypatch: pytest.MonkeyPatch, clip: Path) -> None:
+    monkeypatch.setattr(probe, "_resolve_ffprobe", lambda: None)
+
+    raw = collect_clip(clip)
+
+    assert raw["status"] == "error"
+    assert raw["diagnostics"][0]["stage"] == "resolve"
+    assert "not found" in raw["diagnostics"][0]["message"]
+
+
+def test_invalid_file_reported_without_raising(monkeypatch: pytest.MonkeyPatch, clip: Path) -> None:
+    monkeypatch.setattr(probe, "_resolve_ffprobe", lambda: "/tools/ffprobe")
+    monkeypatch.setattr(probe.subprocess, "run", lambda *args, **kwargs: _completed("", 1, "Invalid data found when processing input"))
+
+    raw = collect_clip(clip)
+
+    assert raw["status"] == "error"
+    assert raw["diagnostics"][-1]["stage"] == "metadata"
+    assert "Invalid data" in raw["diagnostics"][-1]["stderr"]
+
+
+def test_failed_optional_scan_returns_partial_result(monkeypatch: pytest.MonkeyPatch, clip: Path) -> None:
+    monkeypatch.setattr(probe, "_resolve_ffprobe", lambda: "/tools/ffprobe")
+    responses = [
+        _completed("ffprobe version 7.0\n"),
+        _completed(json.dumps({"format": {}, "streams": [], "chapters": []})),
+        _completed("not json"),
+        _completed(json.dumps({"frames": []})),
+    ]
+    monkeypatch.setattr(probe.subprocess, "run", lambda *args, **kwargs: responses.pop(0))
+
+    raw = collect_clip(clip)
+
+    assert raw["status"] == "partial"
+    assert raw["packets"] == []
+    assert raw["decoder_frames"] == []
+    assert raw["diagnostics"][-1]["stage"] == "packets"
+
+
+
+def test_missing_metadata_sections_are_reported_as_error(monkeypatch: pytest.MonkeyPatch, clip: Path) -> None:
+    monkeypatch.setattr(probe, "_resolve_ffprobe", lambda: "/tools/ffprobe")
+    responses = [_completed("ffprobe version 7.0\n"), _completed(json.dumps({}))]
+    monkeypatch.setattr(probe.subprocess, "run", lambda *args, **kwargs: responses.pop(0))
+
+    raw = collect_clip(clip)
+
+    assert raw["status"] == "error"
+    assert raw["diagnostics"][-1]["stage"] == "metadata"
+    assert "missing required sections" in raw["diagnostics"][-1]["message"]
+
+
+def test_missing_packet_or_frame_sections_are_partial(monkeypatch: pytest.MonkeyPatch, clip: Path) -> None:
+    monkeypatch.setattr(probe, "_resolve_ffprobe", lambda: "/tools/ffprobe")
+    responses = [
+        _completed("ffprobe version 7.0\n"),
+        _completed(json.dumps({"format": {}, "streams": [], "chapters": []})),
+        _completed(json.dumps({})),
+        _completed(json.dumps({})),
+    ]
+    monkeypatch.setattr(probe.subprocess, "run", lambda *args, **kwargs: responses.pop(0))
+
+    raw = collect_clip(clip)
+
+    assert raw["status"] == "partial"
+    assert any("required packets section" in item["message"] for item in raw["diagnostics"])
+    assert any("required frames section" in item["message"] for item in raw["diagnostics"])
+
+def test_inventory_wraps_raw_data_in_clip_analysis(clip: Path) -> None:
+    from oneoff.contracts import Candidate, ClipAnalysis
+    from oneoff.inventory import collect_candidate
+
+    candidate = Candidate(source_path=clip, target_path=clip.with_name("output.mp4"))
+    result = collect_candidate(candidate, collector=lambda path: {"status": "error", "source": str(path)})
+
+    assert isinstance(result, ClipAnalysis)
+    assert result.candidate == candidate
+    assert result.raw["status"] == "error"

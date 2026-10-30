@@ -1,5 +1,5 @@
-"""Read-only media analysis helpers."""
+"""Tools for collecting raw media analysis."""
 
-from .probe import ProbeError, collect_clip
+from .probe import collect_clip
 
-__all__ = ["ProbeError", "collect_clip"]
+__all__ = ["collect_clip"]

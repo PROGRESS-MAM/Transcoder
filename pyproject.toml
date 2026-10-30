@@ -27,7 +27,7 @@ version = {attr = "transcoder.transcoder.app_version"}
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["transcoder*"]
+include = ["transcoder*", "oneoff*"]
 
 
 [tool.setuptools.package-data]
