@@ -14,7 +14,7 @@ import sys
 app_name = "Probe Data Streams"
 app_version = "1.0.0"
 
-clip_dir = Path(r"D:\Pfad\zum\Clip")                      # folder with 1x video and 4x audio MXF (OP-Atom)
+clip_dir = Path(r"\\10.0.77.11\Ablage KI Proxy_1\Proxy 10 Mbit\DEFA\.marathon\DEFA Dokumentation\transcode\eingang\722578")                      # folder with 1x video and 4x audio MXF (OP-Atom)
 res_dir = Path(__file__).resolve().parent / "res"         # ffprobe is searched here before PATH
 sample_packets = 3                                        # packets per data stream for hexdump and zero check
 hex_lines = 4                                             # hexdump lines (16 bytes each) shown per sample packet
