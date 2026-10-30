@@ -16,7 +16,7 @@ from transcoder._source import Source
 
 # --------- CONFIG ---------
 app_name = "Transcode Marathon"
-app_version = "0.3.1"
+app_version = "0.3.2"
 
 root_path = Path(r"\\10.0.77.11\Ablage KI Proxy_1\Proxy 10 Mbit")   # like root_path in Marathon's res/config.ini
 work_dir = ".marathon"                      # like work_dir in Marathon's res/config.ini
@@ -246,6 +246,42 @@ def _render_source(source: Source, found: dict) -> Source:
     return replace(source, video=video)
 
 
+def _without_opatom_refs(source: Source) -> tuple[Source, int]:
+    umid_files = {}
+    for file_index, probe in enumerate(source.probes):
+        for stream in probe.get("streams", []):
+            if stream.get("codec_type") not in ("video", "audio"):
+                continue
+            umid = (stream.get("tags") or {}).get("file_package_umid")
+            if isinstance(umid, str) and umid:
+                umid_files.setdefault(umid.casefold(), set()).add(file_index)
+
+    probes = []
+    removed = 0
+    for file_index, probe in enumerate(source.probes):
+        format_tags = (probe.get("format") or {}).get("tags") or {}
+        pattern = format_tags.get("operational_pattern_ul")
+        is_opatom = isinstance(pattern, str) and ".0d010201.10" in pattern.casefold()
+        kept_streams = []
+        for stream in probe.get("streams", []):
+            tags = stream.get("tags") or {}
+            umid = tags.get("file_package_umid")
+            partner_files = umid_files.get(umid.casefold(), set()) if isinstance(umid, str) else set()
+            is_reference = (
+                is_opatom
+                and stream.get("codec_type") == "data"
+                and tags.get("data_type") in ("video", "audio")
+                and any(partner_index != file_index for partner_index in partner_files)
+            )
+            if is_reference:
+                removed += 1
+            else:
+                kept_streams.append(stream)
+        probes.append({**probe, "streams": kept_streams})
+
+    return replace(source, probes=tuple(probes)), removed
+
+
 def run_job(job: dict, output_folder: Path, log_path: Path) -> adapter.JobReport:
     global _last_progress
     _last_progress = 0.0
@@ -288,6 +324,9 @@ def run_job(job: dict, output_folder: Path, log_path: Path) -> adapter.JobReport
         source = _render_source(source, reports["interlace"])
     except _analysis.FixError as exc:
         return _manual([str(exc)], _name(proxy_preset))
+    source, refs = _without_opatom_refs(source)
+    if refs > 0:
+        adapter.log(f"OP-Atom-Verweise ignoriert: {refs}")
     proxy_fixes = [_fix("audio", channels=2), _fix("black_bars"), _fix("interlace")]
     items = [transcoder.output(proxy_preset, output_folder / job["proxy_name"], proxy_fixes, merge=merge, timecode=code)]
     preset, reasons, scan = _name(proxy_preset), _master_reasons(reports, ffe), reports["interlace"]["rating"]

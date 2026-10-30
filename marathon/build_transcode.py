@@ -7,7 +7,7 @@ import PyInstaller.__main__
 
 # --------- CONFIG ---------
 app_name = "Transcode Marathon Build"
-app_version = "0.1.0"
+app_version = "0.3.2"
 
 project = Path(__file__).resolve().parents[1]
 build_folder = project / "build"

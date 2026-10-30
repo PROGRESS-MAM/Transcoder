@@ -1,3 +1,4 @@
+from copy import deepcopy
 from fractions import Fraction
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -14,6 +15,7 @@ if "toolbox" not in sys.modules:
     sys.modules["toolbox"] = toolbox
 
 import transcoder
+from transcoder._source import Source
 from transcoder import _render
 from marathon import transcode_marathon as marathon
 
@@ -80,7 +82,11 @@ class PlateSelectionTests(unittest.TestCase):
 
 class OutputPathTests(unittest.TestCase):
     def test_proxy_and_master_share_centered_fallback_and_timing(self):
-        source = SimpleNamespace(video=object(), channels=[object(), object()])
+        source = Source(
+            files=(Path("film.mov"),), probes=(), video=object(), audio=(),
+            channels=(object(), object()), fps=Fraction(25), duration=12.0,
+            start_tc="00:00:00:00", tc_origin="default", reports={},
+        )
         audio = {"audible": [1, 2], "channels": [{}, {}]}
 
         def analyse(_source, checks, *_args):
@@ -130,6 +136,174 @@ class OutputPathTests(unittest.TestCase):
         self.assertIs(proxy_call.kwargs["timecode"].anchor, transcoder.SOURCE)
         self.assertEqual(len(proxy_call.args[2]), 3)
         self.assertEqual(len(master_call.args[2]), 2)
+
+
+class OpAtomReferenceTests(unittest.TestCase):
+    @staticmethod
+    def _source(probes):
+        return Source(
+            files=tuple(Path(f"clip_{index}.mxf") for index in range(len(probes))),
+            probes=tuple(probes),
+            video=None,
+            audio=(),
+            channels=(),
+            fps=Fraction(25),
+            duration=12.0,
+            start_tc="00:00:00:00",
+            tc_origin="default",
+            reports={"fixture": "unchanged"},
+        )
+
+    @staticmethod
+    def _real_stream(index, media_type, umid):
+        codec_name = "mpeg2video" if media_type == "video" else "pcm_s24le"
+        return {
+            "index": index,
+            "codec_type": media_type,
+            "codec_name": codec_name,
+            "width": 1920 if media_type == "video" else None,
+            "channels": 2 if media_type == "audio" else None,
+            "tags": {
+                "file_package_umid": umid,
+                "language": "eng",
+                "fixture_note": "keep unchanged",
+            },
+            "_fixture_id": f"real-{umid}",
+        }
+
+    @staticmethod
+    def _reference(index, media_type, umid, fixture_id):
+        return {
+            "index": index,
+            "codec_type": "data",
+            "codec_tag_string": "[0][0][0][0]",
+            "nb_frames": "0",
+            "tags": {
+                "data_type": media_type,
+                "file_package_umid": umid,
+                "fixture_note": "keep unchanged",
+            },
+            "_fixture_id": fixture_id,
+        }
+
+    @staticmethod
+    def _probe(index, streams, opatom=True):
+        pattern = (
+            "060E2B34.04010102.0D010201.1002.00000000"
+            if opatom else "060E2B34.04010102.0D010301.0101.00000000"
+        )
+        return {
+            "streams": streams,
+            "format": {
+                "filename": f"clip_{index}.mxf",
+                "duration": "12.000",
+                "tags": {
+                    "operational_pattern_ul": pattern,
+                    "fixture_note": "format unchanged",
+                },
+            },
+            "chapters": [{"id": index, "fixture_note": "unchanged"}],
+        }
+
+    def _assert_result(self, source, removed_count, removed_ids):
+        source_before = deepcopy(source.__dict__)
+        expected_probes = []
+        for probe in source_before["probes"]:
+            expected_probe = deepcopy(probe)
+            expected_probe["streams"] = [
+                stream for stream in expected_probe["streams"]
+                if stream.get("_fixture_id") not in removed_ids
+            ]
+            expected_probes.append(expected_probe)
+
+        result, count = marathon._without_opatom_refs(source)
+
+        self.assertEqual(count, removed_count)
+        self.assertIsNot(result, source)
+        self.assertEqual(result.probes, tuple(expected_probes))
+        self.assertEqual(source.__dict__, source_before)
+        original_media = [
+            stream
+            for probe in source_before["probes"]
+            for stream in probe["streams"]
+            if stream["codec_type"] in ("video", "audio")
+        ]
+        retained_media = [
+            stream
+            for probe in result.probes
+            for stream in probe["streams"]
+            if stream["codec_type"] in ("video", "audio")
+        ]
+        self.assertEqual(retained_media, original_media)
+        return result
+
+    def _clip(self, file_count):
+        media_types = ("video", "audio", "video", "audio", "video")
+        umids = [f"urn:synthetic:package:{index}" for index in range(file_count)]
+        probes = []
+        reference_ids = set()
+        for file_index in range(file_count):
+            streams = [self._real_stream(0, media_types[file_index], umids[file_index])]
+            for target_index in range(file_count):
+                if target_index == file_index:
+                    continue
+                fixture_id = f"ref-{file_index}-{target_index}"
+                reference_ids.add(fixture_id)
+                streams.append(self._reference(
+                    len(streams), media_types[target_index], umids[target_index], fixture_id,
+                ))
+            probes.append(self._probe(file_index, streams))
+        return probes, reference_ids
+
+    def test_five_file_clip_removes_twenty_references(self):
+        probes, reference_ids = self._clip(5)
+        self.assertEqual(len(reference_ids), 20)
+        self._assert_result(self._source(probes), 20, reference_ids)
+
+    def test_three_file_clip_removes_six_references(self):
+        probes, reference_ids = self._clip(3)
+        self.assertEqual(len(reference_ids), 6)
+        self._assert_result(self._source(probes), 6, reference_ids)
+
+    def test_reference_to_missing_partner_is_retained(self):
+        video_umid = "urn:synthetic:own:video"
+        audio_umid = "urn:synthetic:own:audio"
+        missing_umid = "urn:synthetic:missing:partner"
+        probes = [
+            self._probe(0, [
+                self._real_stream(0, "video", video_umid),
+                self._reference(1, "audio", audio_umid, "valid-0-1"),
+                self._reference(2, "video", missing_umid, "missing-partner"),
+            ]),
+            self._probe(1, [
+                self._real_stream(0, "audio", audio_umid),
+                self._reference(1, "video", video_umid, "valid-1-0"),
+            ]),
+        ]
+        result = self._assert_result(
+            self._source(probes), 2, {"valid-0-1", "valid-1-0"},
+        )
+        retained_ids = {
+            stream["_fixture_id"]
+            for probe in result.probes
+            for stream in probe["streams"]
+        }
+        self.assertIn("missing-partner", retained_ids)
+
+    def test_non_opatom_data_stream_is_left_unchanged(self):
+        video_umid = "urn:synthetic:own:video"
+        audio_umid = "urn:synthetic:own:audio"
+        probes = [
+            self._probe(0, [
+                self._real_stream(0, "video", video_umid),
+                self._reference(1, "audio", audio_umid, "data-0-1"),
+            ], opatom=False),
+            self._probe(1, [
+                self._real_stream(0, "audio", audio_umid),
+                self._reference(1, "video", video_umid, "data-1-0"),
+            ], opatom=False),
+        ]
+        self._assert_result(self._source(probes), 0, set())
 
 
 if __name__ == "__main__":
