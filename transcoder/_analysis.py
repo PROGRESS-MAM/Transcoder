@@ -452,6 +452,11 @@ def _sure(found: dict, need: float, what: str) -> None:
                        + (f" ({found['reason']})" if found.get("reason") else ""))
 
 
+def _below(trust: float, need: float) -> bool:
+    """Compare at the two decimals shown in messages, e.g. 0.897 passes 0.90."""
+    return round(trust, 2) < round(need, 2)
+
+
 def fix_interlace(found: dict, values: dict, scan: str) -> tuple[dict, str | None]:
     _sure(found, values["trust"], "Interlacing")
     if found["rating"] == "interlaced" and scan == "progressive":
@@ -476,7 +481,7 @@ def fix_black_bars(found: dict, values: dict, width: int, height: int) -> tuple[
 
 def fix_audio(found: dict, values: dict, target: dict, count: int) -> tuple[dict, str | None]:
     need = values["trust"]
-    if unsure := [channel for channel in found["channels"] if channel["trust"] < need]:
+    if unsure := [channel for channel in found["channels"] if _below(channel["trust"], need)]:
         raise FixError("Ton unsicher: " + ", ".join(f"Kanal {channel['channel']} trust {channel['trust']:.2f}"
                                                      for channel in unsure) + f" < {need:.2f}")
     audible = found["audible"]
@@ -496,7 +501,7 @@ def fix_audio(found: dict, values: dict, target: dict, count: int) -> tuple[dict
         if not any(pair and pair["duplicate"] for pair in matches):
             best = max((pair["similarity"] or 0 for pair in matches if pair), default=0)
             raise FixError(f"Ton: Kanal {channel} hörbar und nicht doppelt zu Kanal 1/2 (Ähnlichkeit {best:.2f})")
-        if any(pair and pair["duplicate"] and pair["trust"] < need for pair in matches):
+        if any(pair and pair["duplicate"] and _below(pair["trust"], need) for pair in matches):
             raise FixError(f"Ton: Dublette mit Kanal {channel} unsicher (trust < {need:.2f})")
     dropped = [number for number in range(1, count + 1) if number not in selected]
     return {"audio_map": selected}, f"Kanäle {selected} ({', '.join(map(str, dropped))} verworfen)" if dropped else None

@@ -297,6 +297,10 @@ def _picture(plan: Plan, width: int, height: int, sar: Fraction, crop, deinterla
     return filters
 
 
+def _master_colors(plan: Plan, source: Source) -> list[str]:
+    return _color_filter(source.video.data) if plan.preset.get("preserve_metadata") else []
+
+
 def _video(graph: _Graph, plan: Plan, segment: tuple, inputs: dict, source: Source, merged: bool) -> str:
     fps = source.fps
     if segment[0] == "black":
@@ -304,7 +308,7 @@ def _video(graph: _Graph, plan: Plan, segment: tuple, inputs: dict, source: Sour
         filters = [f"color=c=black:s={frame_width}x{frame_height}:r={fps.numerator}/{fps.denominator}",
                    f"trim=end_frame={_media.frame_count(segment[1], fps)}",
                    *_picture(plan, frame_width, frame_height, frame_sar, None, False)]
-        return graph.add("", ",".join(filters + ["setpts=PTS-STARTPTS"]))
+        return graph.add("", ",".join(filters + _master_colors(plan, source) + ["setpts=PTS-STARTPTS"]))
     owner = segment[1] if segment[0] in ("file", "canvas") else source
     pad = f"{inputs[(id(owner), owner.video.file)]}:v:{owner.video.ordinal}"
     if segment[0] == "canvas":
@@ -314,7 +318,7 @@ def _video(graph: _Graph, plan: Plan, segment: tuple, inputs: dict, source: Sour
     else:
         crop, deinterlace = (plan.crop, plan.deinterlace) if segment[0] == "source" else (None, False)
         filters = _picture(plan, owner.width, owner.height, owner.sar, crop, deinterlace, owner.field_order)
-    return graph.add(graph.use(pad), ",".join(filters + (["setpts=PTS-STARTPTS"] if merged else [])))
+    return graph.add(graph.use(pad), ",".join(filters + _master_colors(plan, source) + (["setpts=PTS-STARTPTS"] if merged else [])))
 
 
 def _audio(graph: _Graph, plan: Plan, segment: tuple, inputs: dict, source: Source, merged: bool) -> list[str]:
@@ -420,6 +424,15 @@ def _color_args(data: dict) -> list[str]:
     return args
 
 
+def _color_filter(data: dict) -> list[str]:
+    # Current ffmpeg takes primaries/transfer from the frames, not from -color_trc; lavfi frames carry none.
+    names = {"color_space": "colorspace", "color_primaries": "color_primaries", "color_transfer": "color_trc",
+             "color_range": "range"}
+    params = [f"{name}={data[key]}" for key, name in names.items()
+              if data.get(key) not in (None, "unknown", "unspecified", "reserved")]
+    return [f"setparams={':'.join(params)}"] if params else []
+
+
 def _decoded_frame(path: Path) -> dict:
     text, _ = _media.run_text("ffprobe", ["-v", "error", "-select_streams", "v:0", "-read_intervals", "%+#1",
                                        "-show_entries", "frame=interlaced_frame,top_field_first,color_space,color_range,color_transfer,color_primaries",
@@ -475,7 +488,8 @@ def check_source_encoder(source: Source, preset: str | Path) -> None:
         target = Path(folder) / "probe.mov"
         _media.run_text("ffmpeg", ["-nostdin", "-v", "error", "-f", "lavfi", "-i",
                                   f"color=c=black:s={frame[0]}x{frame[1]}:r={source.fps}", "-frames:v", "1", "-an",
-                                  "-vf", f"format={values['video']['pix_fmt']},setsar={frame[2]},setfield={field or 'prog'}",
+                                  "-vf", ",".join([f"format={values['video']['pix_fmt']}", f"setsar={frame[2]}",
+                                                   f"setfield={field or 'prog'}", *_color_filter(source.video.data)]),
                                   *_video_codec_args(values["video"], field), *_color_args(source.video.data),
                                   "-threads:v", "1", "-movflags", "+write_colr", "-f", "mov", str(target)], timeout=30)
         video = _media.probe(target)["streams"][0]

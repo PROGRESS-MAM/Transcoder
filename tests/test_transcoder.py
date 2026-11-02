@@ -51,6 +51,11 @@ class TranscoderTests(unittest.TestCase):
     def test_unclear_silence_stops(self):
         found={'channels':[{'channel':1,'trust':1},{'channel':2,'trust':.8}],'audible':[1]}
         with self.assertRaises(a.FixError):a.fix_audio(found,{'trust':.9},{'min_audible':2},2)
+    def test_audio_trust_rounded_to_message(self):
+        found={'channels':[{'channel':1,'trust':1},{'channel':2,'trust':.897}],'audible':[1]}
+        self.assertEqual(a.fix_audio(found,{'trust':.9},{'min_audible':1},2)[0]['audio_map'],[1,1])
+        found['channels'][1]['trust']=.894
+        with self.assertRaisesRegex(a.FixError,'Kanal 2 trust 0.89 < 0.90'):a.fix_audio(found,{'trust':.9},{'min_audible':1},2)
     def test_master_presets(self):
         _,master=p.load('dnxhr_hqx');_,inter=p.load('dnxhd_185x')
         self.assertEqual(master['video']['frame'],'source');self.assertEqual(inter['video']['frame'],'1920x1080')
@@ -76,7 +81,7 @@ class MediaTests(unittest.TestCase):
         cls.temp_root=TemporaryDirectory();cls.folder=Path(cls.temp_root.name)
         cls.fixture=cls.folder/'source.mkv'
         args=['ffmpeg','-v','error','-nostdin','-y','-f','lavfi','-i',
-              'testsrc2=s=1280x720:r=25,drawbox=x=0:y=0:w=iw:h=50:color=black:t=fill,drawbox=x=0:y=670:w=iw:h=50:color=black:t=fill',
+              'testsrc2=s=1280x720:r=25,drawbox=x=0:y=0:w=iw:h=50:color=black:t=fill,drawbox=x=0:y=670:w=iw:h=50:color=black:t=fill,setparams=colorspace=bt709:color_primaries=bt470bg:color_trc=bt470bg:range=tv',
               '-f','lavfi','-i','sine=frequency=440:sample_rate=44100','-f','lavfi','-i','sine=frequency=880:sample_rate=44100',
               '-f','lavfi','-i','anullsrc=r=44100:cl=mono','-t','1','-map','0:v','-map','1:a','-map','2:a','-map','3:a',
               '-c:v','ffv1','-threads:v','1','-c:a','pcm_s16le','-colorspace','bt709','-color_primaries','bt470bg',
