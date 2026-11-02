@@ -6,9 +6,9 @@ from pathlib import Path
 
 # ---------- CONFIG ----------
 app_name = "check_colors"
-app_version = "0.1.0"
+app_version = "0.2.0"
 
-# Path to the video file of each clip (for OP-Atom: the video MXF)
+# Clip folder (all MXF inside are checked) or path to a single video file
 clips = {
     "DEFA04372 Der Augenzeuge 1949/16 (329617)": r"\\10.0.77.11\Ablage KI Proxy_1\Proxy 10 Mbit\DEFA\.marathon\DEFA Der Augenzeuge\transcode\eingang\329617",
     "DEFA05481 Der Augenzeuge 1966/40 (391361)": r"\\10.0.77.11\Ablage KI Proxy_1\Proxy 10 Mbit\DEFA\.marathon\DEFA Der Augenzeuge\transcode\eingang\391361",
@@ -40,23 +40,37 @@ def video_streams(path: Path) -> list[dict]:
     return json.loads(text).get("streams", [])
 
 
-def report(name: str, file: str) -> None:
-    print(f"\n{name}\n  {file or '(kein Pfad eingetragen)'}")
-    if not file:
+def media_files(path: Path) -> list[Path]:
+    if path.is_dir():
+        return sorted((item for item in path.iterdir() if item.is_file() and item.suffix.casefold() == ".mxf"),
+                      key=lambda item: item.name.casefold())
+    return [path] if path.is_file() else []
+
+
+def report(name: str, entry: str) -> None:
+    print(f"\n{name}\n  {entry or '(kein Pfad eingetragen)'}")
+    if not entry:
         return
-    path = Path(file)
-    if not path.is_file():
-        print("  FEHLER: Datei nicht gefunden")
+    path = Path(entry)
+    if not path.exists():
+        print("  FEHLER: Pfad nicht gefunden")
         return
-    try:
-        streams = video_streams(path)
-    except RuntimeError as exc:
-        print(f"  FEHLER: {exc}")
+    files = media_files(path)
+    if not files:
+        print("  FEHLER: keine MXF im Ordner")
         return
-    if not streams:
-        print("  kein Videostream")
-    for stream in streams:
-        print(f"  Stream {stream.get('index')}: " + ", ".join(f"{key}={stream.get(key, '-')}" for key in fields))
+    found = 0
+    for file in files:
+        try:
+            streams = video_streams(file)
+        except RuntimeError as exc:
+            print(f"  {file.name}: FEHLER: {exc}")
+            continue
+        found += bool(streams)
+        for stream in streams:
+            print(f"  {file.name} Stream {stream.get('index')}: " + ", ".join(f"{key}={stream.get(key, '-')}" for key in fields))
+    if not found:
+        print(f"  keine Videodatei gefunden ({len(files)} Datei(en) geprüft)")
 
 
 # ---------- MAIN ----------
