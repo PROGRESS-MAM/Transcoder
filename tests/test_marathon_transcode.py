@@ -81,50 +81,67 @@ class PlateSelectionTests(unittest.TestCase):
 
 
 class OutputPathTests(unittest.TestCase):
-    def test_proxy_and_master_share_centered_fallback_and_timing(self):
+    def _run_job(self, ffe, audio, black_bars):
         source = Source(
             files=(Path("film.mov"),), probes=(), video=object(), audio=(),
-            channels=(object(), object()), fps=Fraction(25), duration=12.0,
+            channels=tuple(object() for _ in audio["channels"]), fps=Fraction(25), duration=12.0,
             start_tc="00:00:00:00", tc_origin="default", reports={},
         )
-        audio = {"audible": [1, 2], "channels": [{}, {}]}
 
         def analyse(_source, checks, *_args):
             if checks == "streams":
-                return {"streams": {"video": {"width": 1920, "height": 1080, "fps": Fraction(25)}}}
+                return {"streams": {"video": {
+                    "width": 1920, "height": 1080, "fps": Fraction(25)}}}
             if checks == "audio":
                 return {"audio": audio}
             return {
-                "black_bars": {"rating": "none"},
-                "interlace": {"rating": "progressive", "trust": 1.0, "field_order": "tff"},
+                "black_bars": black_bars,
+                "interlace": {
+                    "rating": "progressive", "trust": 1.0, "field_order": "tff"},
             }
 
         results = [
-            SimpleNamespace(state="ok", summary="proxy", file=Path("proxy.mov"), errors=[]),
-            SimpleNamespace(state="ok", summary="master", file=Path("master.mov"), errors=[]),
+            SimpleNamespace(
+                state="ok", summary=role.lower(), file=Path(f"{role.lower()}.mov"), errors=[])
+            for role in (("Proxy", "Master") if ffe else ("Proxy",))
         ]
         job = {
-            "inputs": ["film.mov"], "proxy_name": "proxy.mov", "ffe_tafel": True,
-            "ffe_reference_clips": ["HD_1_66.mov"], "identifier": "ID", "title": "Title",
+            "inputs": ["film.mov"], "proxy_name": "proxy.mov", "ffe_tafel": ffe,
+            "identifier": "ID", "title": "Title",
         }
+        if ffe:
+            job["ffe_reference_clips"] = ["HD_1_66.mov"]
 
-        with patch.object(marathon.adapter, "share_path", side_effect=Path), \
-                patch.object(marathon.adapter, "log"), \
-                patch.object(marathon, "_plate_format", return_value=(1440, 900, Fraction(25))), \
-                patch.object(marathon.transcoder, "source", return_value=source), \
-                patch.object(marathon.transcoder, "analyse", side_effect=analyse), \
-                patch.object(marathon, "_audio_problem", return_value=None), \
-                patch.object(marathon, "_render_source", return_value=source), \
-                patch.object(marathon, "_fix", side_effect=lambda name, **target: (name, target)), \
-                patch.object(marathon._render, "check_source_encoder"), \
-                patch.object(marathon.transcoder, "output", side_effect=[object(), object()]) as output, \
-                patch.object(marathon.transcoder, "render", return_value=results), \
-                patch.object(marathon, "_write_json"):
+        patches = [
+            patch.object(marathon.adapter, "share_path", side_effect=Path),
+            patch.object(marathon.adapter, "log"),
+            patch.object(marathon, "_plate_format", return_value=(1440, 900, Fraction(25))),
+            patch.object(marathon.transcoder, "source", return_value=source),
+            patch.object(marathon.transcoder, "analyse", side_effect=analyse),
+            patch.object(marathon, "_audio_problem", return_value=None),
+            patch.object(marathon, "_render_source", return_value=source),
+            patch.object(marathon, "_fix", side_effect=lambda name, **target: (name, target)),
+            patch.object(marathon._render, "check_source_encoder"),
+            patch.object(marathon.transcoder, "output", side_effect=[object() for _ in results]),
+            patch.object(marathon.transcoder, "render", return_value=results),
+            patch.object(marathon, "_write_json"),
+        ]
+        with patches[0], patches[1], patches[2], patches[3], patches[4], \
+                patches[5] as audio_problem, patches[6], patches[7], patches[8], \
+                patches[9] as output, patches[10], patches[11]:
             report = marathon.run_job(job, Path("out"), Path("worker.log"))
+        self.assertEqual(audio_problem.call_count, 1)
+        self.assertEqual(audio_problem.call_args.args, (source, audio))
+        return report, output.call_args_list
+
+    def test_proxy_and_master_share_centered_fallback_and_timing(self):
+        audio = {"audible": [1, 2], "channels": [{}, {}]}
+        report, calls = self._run_job(
+            True, audio, {"rating": "bars", "bars": {"top": 20, "bottom": 1060}, "trust": 1.0})
 
         self.assertEqual(report.status, "ok")
-        self.assertEqual(output.call_count, 2)
-        proxy_call, master_call = output.call_args_list
+        self.assertEqual(len(calls), 2)
+        proxy_call, master_call = calls
         proxy_merge = proxy_call.kwargs["merge"]
         master_merge = master_call.kwargs["merge"]
         self.assertIs(proxy_merge[0], master_merge[0])
@@ -134,8 +151,27 @@ class OutputPathTests(unittest.TestCase):
         self.assertIs(proxy_merge[2], transcoder.SOURCE)
         self.assertIs(proxy_call.kwargs["timecode"], master_call.kwargs["timecode"])
         self.assertIs(proxy_call.kwargs["timecode"].anchor, transcoder.SOURCE)
-        self.assertEqual(len(proxy_call.args[2]), 3)
-        self.assertEqual(len(master_call.args[2]), 2)
+        self.assertEqual(proxy_call.args[2], [
+            ("audio", {"channels": 2}), ("black_bars", {}), ("interlace", {})])
+        self.assertEqual(master_call.args[2], [])
+        self.assertEqual(marathon.settings["black_bars"]["extra_crop"], 0)
+
+    def test_without_ffe_audio_or_bars_never_create_a_master(self):
+        cases = (
+            ({"audible": [1, 2], "channels": [{}, {}]},
+             {"rating": "bars", "bars": {"top": 20, "bottom": 1060}, "trust": 1.0}),
+            ({"audible": [1], "channels": [{}]}, {"rating": "none"}),
+            ({"audible": [1, 3, 4], "channels": [{}, {}, {}, {}]}, {"rating": "none"}),
+        )
+        for audio, black_bars in cases:
+            with self.subTest(audio=audio, black_bars=black_bars):
+                report, calls = self._run_job(False, audio, black_bars)
+                self.assertEqual(report.status, "ok")
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(calls[0].args[0], marathon.proxy_preset)
+                self.assertEqual(calls[0].args[2], [
+                    ("audio", {"channels": 2}), ("black_bars", {}), ("interlace", {})])
+        self.assertEqual(marathon.settings["black_bars"]["extra_crop"], 0)
 
 
 class OpAtomReferenceTests(unittest.TestCase):

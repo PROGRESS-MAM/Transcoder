@@ -30,7 +30,7 @@ master_preset = "dnxhr_hqx"                 # new masters from progressive sourc
 master_preset_interlaced = "dnxhd_185x"     # new masters from interlaced sources
 ffe_black_seconds = 1                       # black between FFE plate and film
 log_progress_seconds = 30
-settings = {"samples": {"per_minute": 5, "seconds": 2}, "black_bars": {"extra_crop": 10}}
+settings = {"samples": {"per_minute": 5, "seconds": 2}, "black_bars": {"extra_crop": 0}}
 # Halte per_minute × seconds ≤ 60
 
 
@@ -219,21 +219,17 @@ def _job_report(results: list, preset: str) -> adapter.JobReport:
 
 # --------- FUNC USE CASE ---------
 def _master_reasons(reports: dict, ffe: bool) -> list[str]:
-    """Reasons for a new master: mono, silent channels, horizontal black bars or FFE plate."""
-    found = ((len(reports["audio"]["audible"]) == 1, "1 hörbarer Kanal"),
-             (reports["black_bars"]["rating"] == "bars",
-              "schwarze Ränder"),
-             (len(reports["audio"]["audible"]) < len(reports["audio"]["channels"]), "stumme Kanäle"), (ffe, "FFE-Tafel"))
-    return [text for hit, text in found if hit]
+    """Create a new master only when an FFE plate was requested."""
+    return ["FFE-Tafel"] if ffe else []
 
 
-def _audio_problem(source: Source, found: dict, master: bool = False) -> str | None:
-    item = _fix("audio", **({"min_audible": 2} if master else {"channels": 2}))
+def _audio_problem(source: Source, found: dict) -> str | None:
+    item = _fix("audio", channels=2)
     values = _analysis.section("audio", item.settings)
     try:
         _analysis.fix_audio(found, values, item.target, len(source.channels))
     except _analysis.FixError as exc:
-        return f"{'Master' if master else 'Proxy'} fix:audio: {exc}"
+        return f"Proxy fix:audio: {exc}"
     return None
 
 
@@ -314,8 +310,6 @@ def run_job(job: dict, output_folder: Path, log_path: Path) -> adapter.JobReport
         return _manual([f"Analyse audio: {reports['audio']['error']}"], _name(proxy_preset))
     if problem := _audio_problem(source, reports["audio"]):
         return _manual([problem], _name(proxy_preset))
-    if problem := _audio_problem(source, reports["audio"], master=True):
-        return _manual([problem], _name(proxy_preset))
     reports.update(transcoder.analyse(source, checks[2:], settings, _console))
     if problems := [f"Analyse {name}: {report['error']}" for name, report in reports.items() if "error" in report]:
         return _manual(problems, _name(proxy_preset))
@@ -331,7 +325,7 @@ def run_job(job: dict, output_folder: Path, log_path: Path) -> adapter.JobReport
     items = [transcoder.output(proxy_preset, output_folder / job["proxy_name"], proxy_fixes, merge=merge, timecode=code)]
     preset, reasons, scan = _name(proxy_preset), _master_reasons(reports, ffe), reports["interlace"]["rating"]
     if reasons and scan == "unclear":
-        # The master preset depends on the scan; the proxy would fail on the same rating anyway.
+        # The scan selects the master preset and is required for proxy deinterlacing.
         return _manual([f"neuer Master nötig ({', '.join(reasons)}), Interlacing unklar "
                         f"(trust {reports['interlace']['trust']:.2f})"], preset)
     if reasons:
@@ -341,8 +335,7 @@ def run_job(job: dict, output_folder: Path, log_path: Path) -> adapter.JobReport
             _render.check_source_encoder(source, master)
         except (OSError, RuntimeError, ValueError) as exc:
             return _manual([f"Master nicht kompatibel: {exc}"], preset)
-        fixes = [_fix("audio", min_audible=2), _fix("black_bars")]
-        items.append(transcoder.output(master, output_folder / _master_name(job), fixes, merge=merge, timecode=code))
+        items.append(transcoder.output(master, output_folder / _master_name(job), [], merge=merge, timecode=code))
         preset = f"{preset}+{_name(master)}"
         adapter.log(f"Neuer Master {master}: {', '.join(reasons)}")
     else:
