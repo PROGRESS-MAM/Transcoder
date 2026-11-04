@@ -52,6 +52,7 @@ class Plan:
     fixes: list[dict] = field(default_factory=list)
     modify: list[str] = field(default_factory=list)
     command: list[str] = field(default_factory=list)
+    silent_audio: bool = False
 
     @property
     def part(self) -> Path:
@@ -214,9 +215,13 @@ def prepare(source: Source, output, progress: _analysis.Progress, segment_cache:
                  or crop[1] + crop[3] > source.height):
         errors.append(("modify", f"Beschnitt {crop} liegt nicht im Bild {source.width}×{source.height}"))
     layout = preset["audio"]["layout"]
+    silent_audio = not source.channels and output.silent_audio and layout == "stereo"
     channels = changes.get("audio_map") or ([1, 2] if layout == "stereo" else list(range(1, len(source.channels) + 1)))
     if not source.channels:
-        errors.append(("audio", "Source hat keinen Ton"))
+        if silent_audio:
+            channels = [1, 2]
+        else:
+            errors.append(("audio", "Source hat keinen Ton"))
     elif bad := [number for number in channels if not 1 <= number <= len(source.channels)]:
         errors.append(("audio", f"Kanal {', '.join(map(str, bad))} fehlt, Source hat {len(source.channels)} Kanäle"))
     elif layout == "stereo" and len(channels) != 2:
@@ -235,7 +240,8 @@ def prepare(source: Source, output, progress: _analysis.Progress, segment_cache:
     rate = preset["audio"].get("sample_rate") or source.sample_rate
     duration = sum(_segment_frames(segment, source.fps, source) for segment in segments) / float(source.fps)
     return Plan(output, name, preset, target, frame, field_order, bool(changes.get("deinterlace")) and scan == "progressive",
-                crop, tracks, rate, _bits(source, preset), segments, start_tc, duration, results, texts)
+                crop, tracks, rate, _bits(source, preset), segments, start_tc, duration, results, texts,
+                silent_audio=silent_audio)
 
 
 # --------- FUNC GRAPH ---------
@@ -328,7 +334,7 @@ def _audio(graph: _Graph, plan: Plan, segment: tuple, inputs: dict, source: Sour
     labels = []
     for track_number, track in enumerate(plan.tracks, 1):
         if owner is source:
-            numbers = track
+            numbers = [] if plan.silent_audio else track
         elif owner and owner.channels:
             count = len(owner.channels)
             numbers = ([1, 2 if count > 1 else 1] if len(track) == 2 else
@@ -451,10 +457,11 @@ def _source_args(source: Source, plan: Plan, inputs: dict) -> list[str]:
     args = ["-r:v", str(source.fps), "-fps_mode:v", "cfr", "-map_metadata", str(number),
             "-map_metadata:s:v:0", f"{number}:s:v:{ref.ordinal}", "-map_chapters", str(number)]
     args += _color_args(source.video.data)
-    for index, track in enumerate(plan.tracks):
-        channel = source.channels[track[0] - 1]
-        stream = channel.stream
-        args += [f"-map_metadata:s:a:{index}", f"{inputs[(id(source), stream.file)]}:s:a:{stream.ordinal}"]
+    if not plan.silent_audio:
+        for index, track in enumerate(plan.tracks):
+            channel = source.channels[track[0] - 1]
+            stream = channel.stream
+            args += [f"-map_metadata:s:a:{index}", f"{inputs[(id(source), stream.file)]}:s:a:{stream.ordinal}"]
     args += ["-metadata", f"timecode={plan.start_tc}", "-metadata:s:v:0", f"timecode={plan.start_tc}"]
     return args
 

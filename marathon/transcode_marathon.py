@@ -16,7 +16,7 @@ from transcoder._source import Source
 
 # --------- CONFIG ---------
 app_name = "Transcode Marathon"
-app_version = "0.3.4"
+app_version = "0.4.0"
 
 root_path = Path(r"\\10.0.77.11\Ablage KI Proxy_1\Proxy 10 Mbit")   # like root_path in Marathon's res/config.ini
 work_dir = ".marathon"                      # like work_dir in Marathon's res/config.ini
@@ -31,6 +31,7 @@ master_preset_interlaced = "dnxhd_185x"     # new masters from interlaced source
 ffe_black_seconds = 1                       # black between FFE plate and film
 log_progress_seconds = 30
 settings = {"samples": {"per_minute": 5, "seconds": 2}, "black_bars": {"extra_crop": 0}}
+expected_silence = {"LYNXarchive": ("LA",)}
 # Halte per_minute × seconds ≤ 60
 
 
@@ -106,15 +107,27 @@ def _fps(value) -> str:
 
 
 def _analysis_text(reports: dict) -> str:
-    video, audio = reports["streams"]["video"] or {}, reports["audio"]
+    video = reports["streams"]["video"] or {}
+    audio = reports.get("audio", {})
+    audible, channels = audio.get("audible", []), audio.get("channels", [])
     return (f"Analyse: {video.get('width')}×{video.get('height')} {_fps(video.get('fps', 0))} fps, "
             f"Scan {reports['interlace']['rating']}, Ränder {reports['black_bars']['rating']}, "
-            f"hörbar {', '.join(map(str, audio['audible'])) or 'keiner'} von {len(audio['channels'])} Kanälen")
+            f"hörbar {', '.join(map(str, audible)) or 'keiner'} von {len(channels)} Kanälen")
 
 
 # --------- FUNC JOB ---------
 def _texts(value) -> bool:
     return isinstance(value, list) and bool(value) and all(isinstance(item, str) and item.strip() for item in value)
+
+
+def _expected_silence(job: dict) -> bool:
+    collection, identifier = job.get("collection"), job.get("identifier")
+    if not isinstance(collection, str) or not isinstance(identifier, str):
+        return False
+    return any(
+        identifier.strip().startswith(prefix)
+        for prefix in expected_silence.get(collection, ())
+    )
 
 
 def _job_problem(job: dict) -> str | None:
@@ -283,7 +296,13 @@ def run_job(job: dict, output_folder: Path, log_path: Path) -> adapter.JobReport
     _last_progress = 0.0
     if problem := _job_problem(job):
         return adapter.JobReport("failed", f"Job ungültig: {problem}", _name(proxy_preset))
-    ffe, files = job["ffe_tafel"], [adapter.share_path(item) for item in job["inputs"]]
+    expected = _expected_silence(job)
+    ffe = job["ffe_tafel"]
+    if expected and ffe:
+        adapter.log(f"Ton fehlt erwartungsgemäß ({job['collection']}, {job['identifier'].strip()}): "
+                    "manuelle Prüfung wegen FFE-Tafel")
+        return _manual(["FFE-Tafel bei erwarteter Stille"], _name(proxy_preset))
+    files = [adapter.share_path(item) for item in job["inputs"]]
     adapter.log(f"Clip {job.get('clip_id', '?')}: {job['identifier']} {job['title']}, FFE-Tafel {'ja' if ffe else 'nein'}")
     for path in files:
         adapter.log(f"Eingang: {_short(path)}, {_size_text(path)}")
@@ -294,7 +313,8 @@ def run_job(job: dict, output_folder: Path, log_path: Path) -> adapter.JobReport
     reports = transcoder.analyse(source, "streams", settings, _console)
     if problems := [f"Analyse {name}: {report['error']}" for name, report in reports.items() if "error" in report]:
         return _manual(problems, _name(proxy_preset))
-    if not source.channels:
+    silent_audio = expected and not source.channels
+    if not source.channels and not silent_audio:
         return _manual(["Analyse audio: Source hat keinen Ton."], _name(proxy_preset))
     merge, code = [], None
     if ffe:
@@ -305,11 +325,15 @@ def run_job(job: dict, output_folder: Path, log_path: Path) -> adapter.JobReport
         adapter.log(f"FFE-Tafel: {_short(plate)}")
         segment = transcoder.centered(plate, 1920, 1080) if fallback else plate
         merge, code = [segment, transcoder.black(ffe_black_seconds), transcoder.SOURCE], transcoder.timecode(anchor=transcoder.SOURCE)
-    reports.update(transcoder.analyse(source, "audio", settings, _console))
-    if "error" in reports["audio"]:
-        return _manual([f"Analyse audio: {reports['audio']['error']}"], _name(proxy_preset))
-    if problem := _audio_problem(source, reports["audio"]):
-        return _manual([problem], _name(proxy_preset))
+    map_silent_audio = False
+    if not silent_audio:
+        reports.update(transcoder.analyse(source, "audio", settings, _console))
+        if "error" in reports["audio"]:
+            return _manual([f"Analyse audio: {reports['audio']['error']}"], _name(proxy_preset))
+        map_silent_audio = expected and not reports["audio"]["audible"]
+        if not map_silent_audio:
+            if problem := _audio_problem(source, reports["audio"]):
+                return _manual([problem], _name(proxy_preset))
     reports.update(transcoder.analyse(source, checks[2:], settings, _console))
     if problems := [f"Analyse {name}: {report['error']}" for name, report in reports.items() if "error" in report]:
         return _manual(problems, _name(proxy_preset))
@@ -321,8 +345,21 @@ def run_job(job: dict, output_folder: Path, log_path: Path) -> adapter.JobReport
     source, refs = _without_opatom_refs(source)
     if refs > 0:
         adapter.log(f"OP-Atom-Verweise ignoriert: {refs}")
-    proxy_fixes = [_fix("audio", channels=2), _fix("black_bars"), _fix("interlace")]
-    items = [transcoder.output(proxy_preset, output_folder / job["proxy_name"], proxy_fixes, merge=merge, timecode=code)]
+    proxy_fixes = [] if silent_audio or map_silent_audio else [_fix("audio", channels=2)]
+    proxy_fixes.extend((_fix("black_bars"), _fix("interlace")))
+    modify = ()
+    output_options = {}
+    if silent_audio:
+        solution = "stille Stereospur"
+        output_options["silent_audio"] = True
+    elif map_silent_audio:
+        channels = [1, 1] if len(source.channels) == 1 else [1, 2]
+        modify = (transcoder.audio_map(channels),)
+        solution = f"audio_map({channels})"
+    if silent_audio or map_silent_audio:
+        adapter.log(f"Ton fehlt erwartungsgemäß ({job['collection']}, {job['identifier'].strip()}): {solution}")
+    items = [transcoder.output(proxy_preset, output_folder / job["proxy_name"], proxy_fixes, modify=modify,
+                               merge=merge, timecode=code, **output_options)]
     preset, reasons, scan = _name(proxy_preset), _master_reasons(reports, ffe), reports["interlace"]["rating"]
     if reasons and scan == "unclear":
         # The scan selects the master preset and is required for proxy deinterlacing.

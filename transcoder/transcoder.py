@@ -10,7 +10,7 @@ from ._source import Source, open_source
 
 # --------- CONFIG ---------
 app_name = "Transcoder"
-app_version = "0.3.1"
+app_version = "0.4.0"
 
 
 # --------- TYPES ---------
@@ -70,6 +70,7 @@ class _Output:
     modify: tuple[_Modify, ...]
     merge: tuple
     timecode: _Timecode | None
+    silent_audio: bool
 
 
 @dataclass
@@ -225,11 +226,12 @@ def timecode(start: str | None = None, shift: str | None = None, anchor: _Segmen
 
 
 def output(preset: str | Path, file: str | Path, fixes: Iterable[_Fix] = (), modify: Iterable[_Modify] = (),
-           merge: Iterable = (), timecode: _Timecode | None = None) -> _Output:
+           merge: Iterable = (), timecode: _Timecode | None = None, *, silent_audio: bool = False) -> _Output:
     """Description of one output file; render() creates it.
 
     preset: name in transcoder/presets or path to a TOML file. merge: segments in order (file paths, centered(),
     black(), SOURCE); without merge only the source. A change in modify replaces the fix of the same kind.
+    silent_audio allows a full-length silent stereo track when the source has no audio; other layouts reject it.
     """
     fixes, modify, merge = tuple(fixes), tuple(modify), tuple(merge)
     if bad := [item for item in fixes if not isinstance(item, _Fix)]:
@@ -238,7 +240,7 @@ def output(preset: str | Path, file: str | Path, fixes: Iterable[_Fix] = (), mod
         raise ValueError(f"modify: nur crop(), deinterlace(), audio_map(), erhalten {bad!r}.")
     if timecode is not None and not isinstance(timecode, _Timecode):
         raise ValueError("timecode: nur timecode(…).")
-    return _Output(preset, Path(file), fixes, modify, merge, timecode)
+    return _Output(preset, Path(file), fixes, modify, merge, timecode, silent_audio)
 
 
 # --------- FUNC RENDER ---------

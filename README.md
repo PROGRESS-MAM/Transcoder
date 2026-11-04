@@ -1,6 +1,6 @@
 # Transcoder
 
-> **Version 0.2.0:** Vor dem ersten Einsatz des NVIDIA-Proxys ffmpeg, GPU und Treiber mit den Befehlen unter „NVIDIA-Proxy“ prüfen. Für den EXE-Betrieb nach Änderungen einen neuen Windows-Build erstellen.
+> **Versionen:** `transcoder` 0.4.0, `transcode_marathon` 0.4.0. Vor dem ersten Einsatz des NVIDIA-Proxys ffmpeg, GPU und Treiber mit den Befehlen unter „NVIDIA-Proxy“ prüfen. Für den EXE-Betrieb nach Änderungen einen neuen Windows-Build erstellen.
 
 Rendert Mediendateien mit ffmpeg und analysiert sie. Ganz unten stehen zwei Betriebsarten:
 
@@ -83,7 +83,7 @@ Ein einzelner Output: `transcoder.render(src, web)`. Der Kern sucht keine Dateie
 |---|---|
 | `source(files, tc=None)` | Source aus einer oder mehreren Dateien; Streams aller Dateien bilden zusammen die Quelle. `tc` setzt den Start-TC; sonst aus den Dateien, ohne TC `01:00:00:00`. Analysen werden an der Source gemerkt: jede Prüfung läuft je Source und Einstellungen nur einmal, auch über `analyse` und `fix` hinweg |
 | `analyse(source, checks, settings=None, on_message=None)` | Berichte ohne Änderung, `checks` als Name oder Liste; `settings` mit einem Abschnitt je Prüfung (siehe „Einstellungen“); Rückgabe `{Prüfung: Bericht}`, z. B. `reports["audio"]["audible"]`; eine Prüfung, die nicht laufen kann, bekommt `{"error": Text}` |
-| `output(preset, file, fixes=(), modify=(), merge=(), timecode=None)` | beschreibt eine Ausgabedatei; rendert noch nicht. Eine Änderung in `modify` ersetzt den Fix derselben Art (`crop` → `black_bars`, `deinterlace` → `interlace`, `audio_map` → `audio`) |
+| `output(preset, file, fixes=(), modify=(), merge=(), timecode=None, *, silent_audio=False)` | beschreibt eine Ausgabedatei; rendert noch nicht. `silent_audio=True` erzeugt bei einer Source ohne Audiokanäle eine stille Stereospur über die volle Länge; nur für Stereo-Layouts, Standard `False`. Eine Änderung in `modify` ersetzt den Fix derselben Art (`crop` → `black_bars`, `deinterlace` → `interlace`, `audio_map` → `audio`) |
 | `render(source, outputs, on_message=None)` | rendert die Source in einen Output oder eine Liste von Outputs, in einem Durchlauf (die Source wird einmal gelesen); Rückgabe: je Output ein Ergebnis in derselben Reihenfolge |
 | `fix(name, settings=None, **target)` | Fix für einen Output (siehe „Analyse und Fixes“); `target` = was der Fix erreichen soll, z. B. `channels=2`; `settings` = Abschnitt dieser Prüfung, z. B. `settings["audio"]`; ohne `settings` Standardwerte |
 | `crop(x, y, w, h)` | Änderung: Beschnitt auf diese Fläche, dann Einpassen in den Bildrahmen des Presets |
@@ -126,14 +126,14 @@ Jeder Output wird einzeln betrachtet: Ein Output mit Fehler (z. B. Fix nicht sic
 | `streams` | aus den Metadaten: Container, Operational Pattern und Package-ID (MXF), Codecs, Profil, Größe, SAR/DAR, fps, Feldreihenfolge, Pixelformat, Bitrate, Dauer, Start-TC, Audio-Spuren/Kanäle/Layout, Encoder-Angaben (inkl. x264-Optionen) | – |
 | `interlace` | Feldreihenfolge aus den Metadaten, gemessene Anteile interlaced/progressiv, `rating`: `interlaced` / `progressive` / `unclear`, `trust` | `interlaced` → deinterlacen; `progressive` → nichts |
 | `black_bars` | obere/untere Ränder, `bars.left = bars.right = 0`, aktive Fläche, `rating` und `trust` | nur oben/unten beschneiden, `extra_crop` ausschließlich an einer Seite mit erkanntem Rand |
-| `audio` | je Kanal Anteil mit Ton und Spitzenpegel, `audible` (Liste der hörbaren Kanäle), je Kanalpaar Ähnlichkeit (pegelunabhängig), Zeitversatz und Pegelunterschied, `duplicates`, `trust` | siehe unten |
+| `audio` | je Kanal Anteil mit Pegel ≥ Schwelle und Spitzenpegel, `audible` (Liste der hörbaren Kanäle), je Kanalpaar Ähnlichkeit (pegelunabhängig), Zeitversatz und Pegelunterschied, `duplicates`, `trust` | siehe unten |
 
 - **Stichproben:** über die Laufzeit verteilt (`samples.per_minute`, `samples.seconds`) oder über die volle Länge (`samples.full`).
 - **Statistik:** Die Stichproben werden gemeinsam ausgewertet; Ausreißer fallen heraus, z. B. Schwarz am Anfang und Ende oder sehr dunkle Szenen bei `black_bars`. Jede Bewertung hat ein `trust` von 0 bis 1 aus Anzahl und Übereinstimmung der Stichproben (bei `samples.full` für den Ton 1).
 - **Sicherheit:** Ein Fix ändert nur, wenn seine Bewertung mindestens das `trust` seines Abschnitts erreicht; sonst `error` mit Bewertung und erreichter Sicherheit. Für vage Fälle `trust` erhöhen, z. B. `"audio": {"trust": 0.99}`. Beim Ton wird `trust` auf zwei Nachkommastellen gerundet verglichen, z. B. erreicht 0.897 die Schwelle 0.9.
 - **`black_bars`:** Nur Zeilen oben/unten werden bewertet. Schwarz liegt nach Graustufendecodierung bei 0, Toleranz 6 von 255; ein dunklerer Bildbereich wird nicht zum Schwarzreferenzwert erklärt. Verwendet wird der kleinste Rand über alle gültigen Bilder; seitliche Balken lösen keinen Fix aus. Die Erkennung bleibt stichprobenbasiert: Für die ersten Läufe Master manuell vergleichen.
 - **`interlace`:** Die Metadaten sind die erste Angabe; die Messung bestätigt sie. Mit `"interlace": {"source": "metadata"}` gilt nur die Angabe in den Metadaten, ohne Messung.
-- **Stille** wird wie im AQC-Prüftool `digital_silence` gemessen: je Kanal Fenster der Länge `audio.silence_window`, ein Fenster zählt als Ton bei Pegel (RMS) ≥ `audio.silence_threshold`; ein Kanal ist hörbar, wenn sein Anteil an Fenstern mit Ton mindestens `audio.silence_min_active` beträgt. Zusätzlich vergleicht der Transcoder die Kanäle untereinander.
+- **Stille/Kanalerkennung:** Je `audio.silence_window` wird der RMS-Pegel jedes Kanals in dBFS verglichen. Ein Fenster ist auswertbar, wenn mindestens ein Kanal `audio.silence_threshold` erreicht. In einem auswertbaren Fenster gilt ein Kanal als stumm, wenn er unter `audio.silence_threshold` und zugleich mindestens `audio.silence_gap` unter dem lautesten Kanal liegt; sonst gilt er als hörbar. Ein Kanal wird als hörbar bewertet, wenn mindestens die Hälfte seiner Stimmen hörbar ist. Gibt es kein auswertbares Fenster, gelten alle Kanäle als stumm. Die Sicherheit (`trust`) richtet sich nach Zahl und Verteilung der Stimmen; bei `samples.full` ist sie 1.
 
 | Fix | Ergebnis |
 |---|---|
@@ -174,9 +174,9 @@ transcoder.render(src, web)
 | `interlace` | `trust` | `0.9` | geforderte Sicherheit, ab der der Fix ändert (0 bis 1) |
 | `black_bars` | `extra_crop` | `0` | zusätzliche Pixel je Seite mit Rand beim Beschnitt; Seiten ohne Rand bleiben unverändert |
 | `black_bars` | `trust` | `0.9` | wie oben |
-| `audio` | `silence_threshold` | `"-60dB"` | Pegel (RMS je Fenster), ab dem ein Fenster als Ton zählt |
-| `audio` | `silence_min_active` | `"1%"` | Anteil der Fenster mit Ton, ab dem ein Kanal hörbar ist |
-| `audio` | `silence_window` | `"1s"` | Fensterlänge |
+| `audio` | `silence_threshold` | `"-60dB"` | Pegelschwelle (RMS je Fenster); ein Fenster ist auswertbar, wenn mindestens ein Kanal sie erreicht |
+| `audio` | `silence_gap` | `"20dB"` | Mindestabstand zum lautesten Kanal, damit ein Kanal im auswertbaren Fenster als stumm gilt (zusätzlich muss sein Pegel unter `silence_threshold` liegen) |
+| `audio` | `silence_window` | `"1s"` | Fensterlänge für die RMS-Messung |
 | `audio` | `duplicate_min` | `0.95` | Ähnlichkeit, ab der zwei Kanäle als doppelt gelten; darunter nicht doppelt |
 | `audio` | `max_offset_ms` | `40` | erlaubter Zeitversatz beim Kanalvergleich |
 | `audio` | `trust` | `0.9` | wie oben |
@@ -434,20 +434,20 @@ Als EXE: `transcode_marathon_<version>.exe` auf den Rechner kopieren und starten
 
 ### Use-Case-Logik
 
-Je Job: Source aus `inputs`, Analyse (`streams`, `audio`, `black_bars`, `interlace`), dann ein `render`:
+Je Job: Source aus `inputs` und Streams. Bei vorhandenen Audiokanälen folgt die Audioanalyse; nur wenn `expected_silence` greift und kein Kanal hörbar ist, entfällt der Audio-Fix. Ohne Audiokanäle wird die Audioanalyse nur bei passender `expected_silence` übersprungen, sonst endet der Job mit manueller Prüfung. Sofern die Verarbeitung fortgesetzt wird, folgen `black_bars`- und `interlace`-Analyse und danach ein `render`:
 
-- Proxy immer: `proxy_preset` mit `fix("audio", channels=2)`, `fix("black_bars")`, `fix("interlace")`.
-- Neuer Master bei einem hörbaren Kanal, entfallenden stummen Kanälen, oberen/unteren schwarzen Balken oder `"ffe_tafel": true`:
-  - progressiv: `master_preset` mit `fix("audio", min_audible=2)` und `fix("black_bars")`,
-  - interlaced: `master_preset_interlaced` mit Audio-Fix und vertikalem Beschnitt; feldgerecht skalieren, Feldreihenfolge erhalten.
-- Dual-Mono erzeugt keinen neuen Master.
+- Im Normalfall: `proxy_preset` mit `fix("audio", channels=2)`, `fix("black_bars")` und `fix("interlace")`.
+- Ein neuer Master wird nur bei `"ffe_tafel": true` erstellt. Dann wählt der Adapter aus `ffe_reference_clips` die eine Tafel mit Bildgröße und fps der Source (keine oder mehrere → manuelle Prüfung). Proxy und Master bekommen `merge = [<Tafel>, black(ffe_black_seconds), SOURCE]` und `timecode(anchor=SOURCE)`: Tafel (9 s) plus 1 s Schwarz = 10 s vor dem Film, der Film beginnt beim alten Start-TC. Der Master wird passend zur Interlaceanalyse mit `master_preset` (progressiv) oder `master_preset_interlaced` (interlaced) erstellt. Ohne FFE-Tafel entsteht kein neuer Master.
 - Ist ein neuer Master nötig und das Interlacing unklar, endet der Job ohne Rendern mit `rejected`.
-- FFE-Tafel bei `"ffe_tafel": true`: Der Adapter wählt aus `ffe_reference_clips` die eine Tafel mit Bildgröße und fps der Source (keine oder mehrere → `rejected`). Proxy und Master bekommen `merge = [<Tafel>, black(ffe_black_seconds), SOURCE]` und `timecode(anchor=SOURCE)`: Tafel (9 s) plus 1 s Schwarz = 10 s vor dem Film, der Film beginnt beim alten Start-TC.
+- **Erwartete Stille:** `expected_silence = {"LYNXarchive": ("LA",)}` ordnet der Kollektion `LYNXarchive` das Identifier-Präfix `LA` zu. Die Kollektion muss exakt passen; beim Identifier werden äußere Leerzeichen entfernt, das Präfix ist groß-/kleinschreibungssensitiv. Fehlt eines der Felder, greift die Regel nicht.
+  - Hat eine passende Source keine Audiokanäle, entfallen Audioanalyse und Audio-Fix; der Proxy erhält mit `silent_audio=True` eine stille Stereospur über die volle Länge. Ohne passende Regel wird „Source hat keinen Ton“ manuell geprüft.
+  - Hat die passende Source Audiokanäle, aber keinen als hörbar bewerteten Kanal, wird unabhängig vom `trust` der Audio-Fix ausgelassen und stattdessen `audio_map([1, 2])` verwendet; bei genau einem Quellkanal `audio_map([1, 1])`.
+  - Erwartete Stille zusammen mit `"ffe_tafel": true` wird manuell geprüft.
 - Scheitert ein Output des Jobs, löscht der Adapter die übrigen Mediendateien des Jobs (ihre `.render.json` bleiben); Marathon bekommt nur vollständige Ergebnisse.
 
 ### Verarbeitung und Fehler
 
-- Nach dem Lesen der Streams zuerst fehlenden Ton und bei FFE-Jobs die passende Tafel prüfen. Nach der Audioanalyse die benötigten Audiobelegungen prüfen. Steht eine Ablehnung bereits fest, keine Rand- oder Interlaceanalyse mehr starten.
+- Eine Kombination aus `expected_silence` und FFE-Tafel wird vor dem Einlesen der Source manuell geprüft. Sonst prüft der Adapter nach den Streams fehlenden Ton (außer bei passender erwarteter Stille) und bei FFE-Jobs die passende Tafel. Nach der Audioanalyse prüft er die benötigten Audiobelegungen. Steht eine Ablehnung bereits fest, keine Rand- oder Interlaceanalyse mehr starten.
 - Bei identischen Stichprobeneinstellungen Ränder und Interlace gemeinsam aus einmal decodierten Stichproben bestimmen. Individuelle Einstellungen je Prüfung und `samples.full` bleiben nutzbar. Die Vertrauensschwellen bleiben unverändert; die Balkenauswertung berücksichtigt ausschließlich obere/untere schwarze Ränder.
 - Bei erfolgreichem Rendern Proxy und ggf. Master weiterhin in einem gemeinsamen ffmpeg-Durchlauf erzeugen; die Quelle nur einmal einlesen.
 - Den Scanmodus des Marathon-Masters an der eindeutigen Interlaceanalyse ausrichten: progressive Ausgabe mit DNxHR HQX, interlaced Ausgabe mit DNxHD 185x und der ermittelten Feldreihenfolge. Veraltete `-top`-Encoderoptionen nicht verwenden.
@@ -467,7 +467,8 @@ Voraussetzung: `ffmpeg` und `ffprobe` liegen in `res/`, sonst bricht der Build a
 
 | Eintrag | Wert | Bedeutung |
 |---|---|---|
-| `app_version` | | Version der EXE |
+| `app_version` | `0.4.0` | Version der EXE (`transcode_marathon`) |
+| `expected_silence` | `{"LYNXarchive": ("LA",)}` | Kollektion und Identifier-Präfixe, für die fehlender Ton erwartet wird (siehe Use-Case-Logik) |
 | `root_path` | `\\10.0.77.11\Ablage KI Proxy_1\Proxy 10 Mbit` | Wurzel der Marathon-Freigabe, wie `root_path` in Marathons `res/config.ini` |
 | `work_dir` | `.marathon` | Arbeitsordner von Marathon, wie `work_dir` in Marathons `res/config.ini` |
 | `master_dir` | `\\10.0.77.11\Ablage KI Proxy_1\++ Master repariert` | nur zum Kürzen der Pfade, wie `[ingest] master_dir` |

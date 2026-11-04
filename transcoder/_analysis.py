@@ -17,7 +17,7 @@ defaults = {
     "samples": {"per_minute": 6, "seconds": 2, "full": False},
     "interlace": {"source": "analyse", "trust": 0.9},
     "black_bars": {"extra_crop": 0, "trust": 0.9},
-    "audio": {"silence_threshold": "-60dB", "silence_min_active": "1%", "silence_window": "1s",
+    "audio": {"silence_threshold": "-60dB", "silence_window": "1s", "silence_gap": "20dB",
               "duplicate_min": 0.95, "max_offset_ms": 40, "trust": 0.9},
 }
 bars_fps = 4                    # frames per second read from a sample for black_bars
@@ -93,7 +93,8 @@ def _validate(check: str, values: dict) -> None:
         raise ValueError(f"black_bars.extra_crop muss eine ganze Zahl ab 0 sein, erhalten {values['extra_crop']!r}.")
     if check == "audio":
         _media.decibel(values["silence_threshold"], "audio.silence_threshold")
-        _media.percent(values["silence_min_active"], "audio.silence_min_active")
+        if _media.decibel(values["silence_gap"], "audio.silence_gap") <= 0:
+            raise ValueError("audio.silence_gap muss größer als 0 sein.")
         if _media.seconds(values["silence_window"], "audio.silence_window") <= 0:
             raise ValueError("audio.silence_window muss größer 0 sein.")
         if not 0 < values["duplicate_min"] <= 1 or values["max_offset_ms"] < 0:
@@ -331,12 +332,14 @@ def check_audio(source: Source, values: dict, progress: Progress) -> dict:
     if not count:
         raise ValueError("Source hat keinen Ton.")
     rate, full = source.sample_rate, values["samples"]["full"]
-    level = 10 ** (_media.decibel(values["silence_threshold"], "audio.silence_threshold") / 20)
-    min_active = _media.percent(values["silence_min_active"], "audio.silence_min_active") / 100
+    threshold_db = _media.decibel(values["silence_threshold"], "audio.silence_threshold")
+    level = 10 ** (threshold_db / 20)
+    gap_db = _media.decibel(values["silence_gap"], "audio.silence_gap")
     window = max(1, round(_media.seconds(values["silence_window"], "audio.silence_window") * rate))
     factor = max(1, rate // compare_rate)
     lag = round(values["max_offset_ms"] / 1000 * rate / factor)
-    active, total, hits, windows = np.zeros(count), np.zeros(count), np.zeros(count, int), np.zeros(count, int)
+    active, total, windows = np.zeros(count), np.zeros(count), np.zeros(count, int)
+    points, votes = np.zeros(count, int), np.zeros(count, int)
     peak = np.zeros(count)
     pairs = {pair: [] for pair in combinations(range(count), 2)}
     found_spans = spans(source.duration, values["samples"])
@@ -353,8 +356,18 @@ def check_audio(source: Source, values: dict, progress: Progress) -> dict:
             for means, length_samples in parts:
                 loud = means >= level ** 2
                 active += loud.sum(axis=0) * length_samples
-                hits += loud.sum(axis=0)
                 windows += len(means)
+                rms_windows = np.sqrt(means)
+                dbfs = np.full(rms_windows.shape, -120.0)
+                nonzero = rms_windows > 0
+                dbfs[nonzero] = np.maximum(20 * np.log10(rms_windows[nonzero]), -120.0)
+                loudest_db = dbfs.max(axis=1)
+                measurable = loudest_db >= threshold_db
+                measurable_count = int(measurable.sum())
+                points += measurable_count
+                for channel in range(count):
+                    silent = (dbfs[:, channel] < threshold_db) & (loudest_db - dbfs[:, channel] >= gap_db)
+                    votes[channel] += int((measurable & ~silent).sum())
             total += frames
             peak = np.maximum(peak, np.abs(block).max(axis=0))
             # Channels are compared only where both carry sound in this block.
@@ -371,11 +384,11 @@ def check_audio(source: Source, values: dict, progress: Progress) -> dict:
                     pairs[(a, b)].append((similarity, offset, 20 * math.log10(rms[b] / rms[a])))
     channels = []
     for index, ref in enumerate(source.channels):
-        audible = bool(total[index]) and active[index] / total[index] >= min_active
-        chance = share_above(int(hits[index]), int(windows[index]), min_active)
-        trust = 1.0 if full else round(chance if audible else 1 - chance, 4)
+        measured_points = int(points[index]) or int(windows[index])
+        audible, trust = _rated(int(votes[index]), measured_points, 0.5, full) if measured_points else (False, 0.0)
         channels.append({"channel": ref.number, "file": source.files[ref.stream.file].name, "stream": ref.stream.ordinal,
-                         "audible": audible, "active": round(float(active[index] / max(total[index], 1)) * 100, 2),
+                         "audible": audible, "points": measured_points, "votes": int(votes[index]),
+                         "active": round(float(active[index] / max(total[index], 1)) * 100, 2),
                          "peak_db": round(20 * math.log10(peak[index]), 1) if peak[index] > 0 else None,
                          "trust": trust})
     results = []
