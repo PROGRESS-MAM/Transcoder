@@ -117,3 +117,95 @@ def test_full_samples_report_perfect_trust():
     result = check_levels([[0.1] * 10, [0.0] * 10], full=True)
 
     assert all(channel["trust"] == 1.0 for channel in result["channels"])
+
+
+
+def make_speech_signal():
+    rate = 48000
+    time = np.arange(rate * 2, dtype=np.float64) / rate
+    frequency = 110.0 + 20.0 * np.sin(2.0 * np.pi * 0.7 * time)
+    phase = 2.0 * np.pi * np.cumsum(frequency) / rate
+    harmonics = sum(np.sin(k * phase) / k for k in range(1, 21))
+    envelope = np.clip(np.sin(2.0 * np.pi * 3.0 * time), 0.0, None)
+    rng = np.random.default_rng(731)
+    signal = harmonics * envelope + rng.normal(0.0, 0.02, time.size)
+    return (signal * (0.2 / np.max(np.abs(signal)))).astype(np.float32)
+
+
+def check_audio_block(block, *, values=None):
+    channels = [
+        SimpleNamespace(number=index + 1, stream=SimpleNamespace(file=0, ordinal=index))
+        for index in range(block.shape[1])
+    ]
+    source = SimpleNamespace(
+        channels=channels,
+        files=[SimpleNamespace(name="synthetic.wav")],
+        sample_rate=48000,
+        duration=120.0,
+    )
+    settings = analysis.section(
+        "audio",
+        {"samples": {"per_minute": 6, "seconds": 2, "full": False}, **(values or {})},
+    )
+    with patch.object(analysis, "_audio_blocks", side_effect=lambda *a, **k: iter([block])):
+        return analysis.check_audio(source, settings, lambda *_: None)
+
+
+def test_verpolte_kanaele_are_duplicates():
+    signal = make_speech_signal()
+    rng = np.random.default_rng(932)
+    block = np.column_stack((signal, -1.9 * signal, rng.normal(0.0, 0.05, signal.size))).astype(np.float32)
+
+    result = check_audio_block(block)
+    pairs = {tuple(pair["channels"]): pair for pair in result["pairs"]}
+
+    pair = pairs[(1, 2)]
+    assert pair["similarity"] >= 0.99
+    assert pair["inverted"] is True
+    assert pair["duplicate"] is True
+    assert pair["level_db"] == pytest.approx(5.6, abs=0.1)
+    for channels in ((1, 3), (2, 3)):
+        assert pairs[channels]["duplicate"] is False
+        assert pairs[channels]["similarity"] < 0.3
+    assert result["duplicates"] == [[1, 2]]
+
+
+def test_fix_audio_discards_a_reversed_duplicate():
+    signal = make_speech_signal()
+    rng = np.random.default_rng(933)
+    block = np.column_stack((signal, rng.normal(0.0, 0.05, signal.size), -1.9 * signal)).astype(np.float32)
+    result = check_audio_block(block)
+
+    mapping, message = analysis.fix_audio(result, analysis.section("audio"), {"channels": 2}, 3)
+
+    assert mapping == {"audio_map": [1, 2]}
+    assert message is not None and "3 verworfen" in message
+
+
+SHIFT_NOISE_STD = 0.05
+
+
+def test_shifted_pair_uses_similarity_threshold():
+    signal = make_speech_signal()
+    noise = np.random.default_rng(931).normal(0.0, SHIFT_NOISE_STD, signal.size)
+    block = np.column_stack((signal, -np.roll(signal, 72) + noise)).astype(np.float32)
+
+    result = check_audio_block(block)
+    pair = result["pairs"][0]
+    assert 0.90 <= pair["similarity"] < 0.95
+    assert pair["duplicate"] is True
+    assert pair["inverted"] is True
+    assert abs(pair["offset_ms"]) == pytest.approx(1.5, abs=0.2)
+
+    stricter = check_audio_block(block, values={"duplicate_min": 0.95})
+    assert stricter["pairs"][0]["duplicate"] is False
+
+
+def test_audio_duplicate_min_defaults_to_0_9():
+    assert analysis.section("audio")["duplicate_min"] == 0.9
+
+
+def test_transcoder_version_is_0_4_1():
+    from transcoder import transcoder
+
+    assert transcoder.app_version == "0.4.1"

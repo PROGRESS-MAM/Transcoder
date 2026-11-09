@@ -66,7 +66,7 @@ def _run(job, channel_count, audible=None, trust=1.0, tmp_path=None):
 
 
 def test_config_and_expected_silence_matching_rules():
-    assert marathon.expected_silence == {"LYNXarchive": ("LA",)}
+    assert marathon.expected_silence == {"LYNXarchive": ("LA",), "Historiathek": ("H",)}
     assert marathon._expected_silence(_job(identifier=" LA000674 "))
     assert not marathon._expected_silence(_job(identifier="la000674"))
     assert not marathon._expected_silence(_job(collection="lynxarchive"))
@@ -75,6 +75,14 @@ def test_config_and_expected_silence_matching_rules():
     assert not marathon._expected_silence(_job(identifier="PROB1051"))
     assert not marathon._expected_silence(_job(collection=None))
     assert not marathon._expected_silence({"identifier": "LA000674"})
+    assert marathon._expected_silence(_job(collection="Historiathek", identifier=" H00015 "))
+    assert not marathon._expected_silence(_job(collection="Historiathek", identifier="h00015"))
+    assert not marathon._expected_silence(_job(collection="historiathek", identifier="H00015"))
+    assert not marathon._expected_silence(_job(collection="Historiathek", identifier="LA000674"))
+
+
+def test_app_version_is_0_4_1():
+    assert marathon.app_version == "0.4.1"
 
 
 def test_expected_silence_without_channels_uses_stereo_silence(tmp_path):
@@ -90,6 +98,18 @@ def test_expected_silence_without_channels_uses_stereo_silence(tmp_path):
     assert any("Ton fehlt erwartungsgemäß (LYNXarchive, LA000674): stille Stereospur" in call.args[0]
                for call in log.call_args_list)
     assert any("hörbar keiner von 0 Kanälen" in call.args[0] for call in log.call_args_list)
+
+
+def test_historiathek_expected_silence_without_channels_uses_stereo_silence(tmp_path):
+    job = _job(collection="Historiathek", identifier="H00015")
+    report, analyzed, output, audio_problem, fix, log = _run(job, 0, tmp_path=tmp_path)
+
+    assert report.status == "ok"
+    audio_problem.assert_not_called()
+    assert output.call_args.kwargs["silent_audio"] is True
+    assert output.call_args.kwargs["modify"] == ()
+    assert any("Ton fehlt erwartungsgemäß (Historiathek, H00015)" in call.args[0]
+               for call in log.call_args_list)
 
 
 def test_expected_silence_with_two_silent_channels_maps_stereo_even_at_low_trust(tmp_path):

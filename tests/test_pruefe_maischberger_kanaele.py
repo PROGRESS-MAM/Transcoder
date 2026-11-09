@@ -44,7 +44,7 @@ def test_inverted_pair_and_verdict(signal: np.ndarray) -> None:
     assert summary["inverted_share"] == 1.0
 
 
-def test_inverted_near_max_matches_transcoder(signal: np.ndarray) -> None:
+def test_inverted_similarity_matches_absolute_peak(signal: np.ndarray) -> None:
     rate = 48000
     factor = max(1, rate // 8000)
     a = signal.astype(np.float64)
@@ -58,9 +58,11 @@ def test_inverted_near_max_matches_transcoder(signal: np.ndarray) -> None:
     norms = np.array([np.sqrt(np.sum(reduced_a ** 2)) + 1e-12,
                       np.sqrt(np.sum(reduced_b ** 2)) + 1e-12])
     spectra = [np.fft.rfft(reduced_a, size), np.fft.rfft(reduced_b, size)]
-    expected, _ = _analysis._similarity(spectra, norms, 0, 1, size, lag)
-    actual = p.pair_values(a, b, rate)["near_max"]
-    assert actual == pytest.approx(expected, abs=1e-6)
+    similarity, offset, inverted = _analysis._similarity(spectra, norms, 0, 1, size, lag)
+    values = p.pair_values(a, b, rate)
+    assert similarity == pytest.approx(abs(values["peak"]), abs=1e-6)
+    assert inverted is True
+    assert offset == 0
 
 
 def test_shifted_pair_and_verdict(signal: np.ndarray) -> None:

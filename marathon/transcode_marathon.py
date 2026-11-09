@@ -16,7 +16,7 @@ from transcoder._source import Source
 
 # --------- CONFIG ---------
 app_name = "Transcode Marathon"
-app_version = "0.4.0"
+app_version = "0.4.1"
 
 root_path = Path(r"\\10.0.77.11\Ablage KI Proxy_1\Proxy 10 Mbit")   # like root_path in Marathon's res/config.ini
 work_dir = ".marathon"                      # like work_dir in Marathon's res/config.ini
@@ -31,7 +31,7 @@ master_preset_interlaced = "dnxhd_185x"     # new masters from interlaced source
 ffe_black_seconds = 1                       # black between FFE plate and film
 log_progress_seconds = 30
 settings = {"samples": {"per_minute": 5, "seconds": 2}, "black_bars": {"extra_crop": 0}}
-expected_silence = {"LYNXarchive": ("LA",)}
+expected_silence = {"LYNXarchive": ("LA",), "Historiathek": ("H",)}
 # Halte per_minute × seconds ≤ 60
 
 

@@ -18,7 +18,7 @@ defaults = {
     "interlace": {"source": "analyse", "trust": 0.9},
     "black_bars": {"extra_crop": 0, "trust": 0.9},
     "audio": {"silence_threshold": "-60dB", "silence_window": "1s", "silence_gap": "20dB",
-              "duplicate_min": 0.95, "max_offset_ms": 40, "trust": 0.9},
+              "duplicate_min": 0.9, "max_offset_ms": 40, "trust": 0.9},
 }
 bars_fps = 4                    # frames per second read from a sample for black_bars
 bars_full_fps = 1               # the same with samples.full
@@ -320,11 +320,12 @@ def _audio_blocks(source: Source, start: float, length: float, full: bool, rate:
             yield np.hstack([array[:frames] for array in arrays])
 
 
-def _similarity(spectra: list[np.ndarray], norms: np.ndarray, a: int, b: int, size: int, lag: int) -> tuple[float, int]:
+def _similarity(spectra: list[np.ndarray], norms: np.ndarray, a: int, b: int, size: int, lag: int) -> tuple[float, int, bool]:
     correlation = np.fft.irfft(spectra[a] * np.conj(spectra[b]), size)
     lags = np.concatenate([correlation[size - lag:], correlation[:lag + 1]]) if lag else correlation[:1]
-    best = int(np.argmax(lags))
-    return float(lags[best] / (norms[a] * norms[b])), best - lag
+    best = int(np.argmax(np.abs(lags)))
+    value = float(lags[best] / (norms[a] * norms[b]))
+    return abs(value), best - lag, value < 0
 
 
 def check_audio(source: Source, values: dict, progress: Progress) -> dict:
@@ -380,8 +381,8 @@ def check_audio(source: Source, values: dict, progress: Progress) -> dict:
             rms = np.sqrt(np.square(block).mean(axis=0)) + 1e-12
             for a, b in pairs:
                 if loud_block[a] and loud_block[b]:
-                    similarity, offset = _similarity(spectra, norms, a, b, size, lag)
-                    pairs[(a, b)].append((similarity, offset, 20 * math.log10(rms[b] / rms[a])))
+                    similarity, offset, inverted = _similarity(spectra, norms, a, b, size, lag)
+                    pairs[(a, b)].append((similarity, offset, 20 * math.log10(rms[b] / rms[a]), inverted))
     channels = []
     for index, ref in enumerate(source.channels):
         measured_points = int(points[index]) or int(windows[index])
@@ -395,11 +396,12 @@ def check_audio(source: Source, values: dict, progress: Progress) -> dict:
     for (a, b), found in pairs.items():
         if not (channels[a]["audible"] and channels[b]["audible"]):
             continue
-        votes = sum(similarity >= values["duplicate_min"] for similarity, _, _ in found)
+        votes = sum(similarity >= values["duplicate_min"] for similarity, _, _, _ in found)
         duplicate, trust = _rated(votes, len(found), 0.5, False) if found else (False, 0.0)
-        results.append({"channels": [a + 1, b + 1], "similarity": round(median(s for s, _, _ in found), 3) if found else None,
-                        "offset_ms": round(median(o for _, o, _ in found) * factor / rate * 1000, 1) if found else None,
-                        "level_db": round(median(d for _, _, d in found), 1) if found else None,
+        results.append({"channels": [a + 1, b + 1], "similarity": round(median(s for s, _, _, _ in found), 3) if found else None,
+                        "offset_ms": round(median(o for _, o, _, _ in found) * factor / rate * 1000, 1) if found else None,
+                        "level_db": round(median(d for _, _, d, _ in found), 1) if found else None,
+                        "inverted": bool(found) and sum(inv for *_, inv in found) * 2 > len(found),
                         "duplicate": bool(found) and duplicate, "trust": trust if found else 0.0, "blocks": len(found)})
     return {"trust": min(channel["trust"] for channel in channels), "rate": rate, "channels": channels,
             "audible": [channel["channel"] for channel in channels if channel["audible"]],
