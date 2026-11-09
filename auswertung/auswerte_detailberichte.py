@@ -23,7 +23,7 @@ state_path = marathon_root / "state" / "marathon.json"
 output_path = Path(__file__).resolve().parent / "auswertung_detailberichte.txt"
 
 # Number of calendar days to include; None processes every matching report.
-TAGE = None
+TAGE = 5
 
 
 # --------- STATIC ---------
