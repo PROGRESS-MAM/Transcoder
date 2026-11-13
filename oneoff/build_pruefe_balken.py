@@ -1,28 +1,28 @@
 # --------- IMPORTS ---------
-from pathlib import Path
 import ast
 import os
+from pathlib import Path
 import shutil
 import sys
 import PyInstaller.__main__
 
 
 # --------- CONFIG ---------
-app_name = "Repariere Zeitstempel Build"
-app_version = "0.2.0"
+app_name = "Prüfe Balken Build"
+app_version = "0.1.0"
 
 here = Path(__file__).resolve().parent
 project = here.parent
-script = here / "repariere_zeitstempel.py"
-config_file = here / "config.ini"                        # template, copied next to the exe if none is there yet
-dist_folder = here / "dist"                              # exe and config.ini end up here
-build_folder = project / "build" / "repariere_zeitstempel"
-tools = ("ffmpeg", "ffprobe")                            # must lie in res/ of the project, they are packed into the exe
+script = here / "pruefe_balken.py"
+config_file = here / "pruefe_balken.ini"
+dist_folder = here / "dist"
+build_folder = project / "build" / "pruefe_balken"
+tools = ("ffmpeg", "ffprobe")
 
 
 # --------- FUNC ---------
 def _settings(path: Path, names: tuple[str, ...]) -> dict:
-    """Literal values of top level settings, read without importing the script."""
+    """Read literal top-level settings without importing the script."""
     found = {node.targets[0].id: ast.literal_eval(node.value) for node in ast.parse(path.read_text(encoding="utf-8")).body
              if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
              and node.targets[0].id in names}
@@ -56,15 +56,16 @@ def main() -> None:
         sys.exit(f"{' und '.join(missing)} {'fehlt' if len(missing) == 1 else 'fehlen'} in {project / 'res'}: "
                  f"für die EXE dort ablegen (ffmpeg.exe, ffprobe.exe).")
     settings = _settings(script, ("app_name", "app_version"))
-    exe_name = f"repariere_zeitstempel_{settings['app_version']}"
+    exe_name = f"pruefe_balken_{settings['app_version']}"
     PyInstaller.__main__.run([
         str(script), "--onefile", "--console", "--noconfirm", "--name", exe_name,
-        "--add-data", f"{project / 'res'}{os.pathsep}res",
+        "--paths", str(here), "--add-data", f"{project / 'res'}{os.pathsep}res",
         "--version-file", str(_version_file(settings["app_name"], settings["app_version"], exe_name)),
         "--distpath", str(dist_folder), "--workpath", str(build_folder), "--specpath", str(build_folder),
     ])
     target_config = dist_folder / config_file.name
     if not target_config.exists():
+        dist_folder.mkdir(parents=True, exist_ok=True)
         shutil.copy2(config_file, target_config)
     print(f"Fertig: {dist_folder / exe_name}.exe mit {target_config}")
 
