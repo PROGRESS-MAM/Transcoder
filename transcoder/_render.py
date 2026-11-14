@@ -196,7 +196,9 @@ def prepare(source: Source, output, progress: _analysis.Progress, segment_cache:
             if item.name == "interlace":
                 change, detail = _analysis.fix_interlace(found, values, scan)
             elif item.name == "black_bars":
-                change, detail = _analysis.fix_black_bars(found, values, source.width, source.height)
+                frame = _frame(source, preset, None) if values["sides"] and preset["video"]["frame"] not in ("source", "raster") \
+                    and preset["video"].get("fit", "contain") == "contain" else None
+                change, detail = _analysis.fix_black_bars(found, values, source.width, source.height, source.sar, frame)
             else:
                 change, detail = _analysis.fix_audio(found, values, item.target, len(source.channels))
         except _analysis.FixError as exc:

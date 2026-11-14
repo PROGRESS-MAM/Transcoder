@@ -16,7 +16,7 @@ from transcoder._source import Source
 
 # --------- CONFIG ---------
 app_name = "Transcode Marathon"
-app_version = "0.4.1"
+app_version = "0.5.0"
 
 root_path = Path(r"\\10.0.77.11\Ablage KI Proxy_1\Proxy 10 Mbit")   # like root_path in Marathon's res/config.ini
 work_dir = ".marathon"                      # like work_dir in Marathon's res/config.ini
@@ -30,7 +30,7 @@ master_preset = "dnxhr_hqx"                 # new masters from progressive sourc
 master_preset_interlaced = "dnxhd_185x"     # new masters from interlaced sources
 ffe_black_seconds = 1                       # black between FFE plate and film
 log_progress_seconds = 30
-settings = {"samples": {"per_minute": 5, "seconds": 2}, "black_bars": {"extra_crop": 0}}
+settings = {"samples": {"per_minute": 5, "seconds": 2}, "black_bars": {"extra_crop": 0, "sides": True}}
 expected_silence = {"LYNXarchive": ("LA",), "Historiathek": ("H",)}
 # Halte per_minute × seconds ≤ 60
 
@@ -110,8 +110,11 @@ def _analysis_text(reports: dict) -> str:
     video = reports["streams"]["video"] or {}
     audio = reports.get("audio", {})
     audible, channels = audio.get("audible", []), audio.get("channels", [])
+    bars = reports["black_bars"]
+    sides = bars.get("sides")
+    side_text = f", Seitenbalken {sides['left']}/{sides['right']} px" if sides else ""
     return (f"Analyse: {video.get('width')}×{video.get('height')} {_fps(video.get('fps', 0))} fps, "
-            f"Scan {reports['interlace']['rating']}, Ränder {reports['black_bars']['rating']}, "
+            f"Scan {reports['interlace']['rating']}, Ränder {bars['rating']}{side_text}, "
             f"hörbar {', '.join(map(str, audible)) or 'keiner'} von {len(channels)} Kanälen")
 
 

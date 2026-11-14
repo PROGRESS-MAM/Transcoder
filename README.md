@@ -1,6 +1,6 @@
 # Transcoder
 
-> **Versionen:** `transcoder` 0.4.1, `transcode_marathon` 0.4.1. Vor dem ersten Einsatz des NVIDIA-Proxys ffmpeg, GPU und Treiber mit den Befehlen unter „NVIDIA-Proxy“ prüfen. Für den EXE-Betrieb nach Änderungen einen neuen Windows-Build erstellen.
+> **Versionen:** `transcoder` 0.5.0, `transcode_marathon` 0.5.0. Vor dem ersten Einsatz des NVIDIA-Proxys ffmpeg, GPU und Treiber mit den Befehlen unter „NVIDIA-Proxy“ prüfen. Für den EXE-Betrieb nach Änderungen einen neuen Windows-Build erstellen.
 
 Rendert Mediendateien mit ffmpeg und analysiert sie. Ganz unten stehen zwei Betriebsarten:
 
@@ -125,13 +125,13 @@ Jeder Output wird einzeln betrachtet: Ein Output mit Fehler (z. B. Fix nicht sic
 |---|---|---|
 | `streams` | aus den Metadaten: Container, Operational Pattern und Package-ID (MXF), Codecs, Profil, Größe, SAR/DAR, fps, Feldreihenfolge, Pixelformat, Bitrate, Dauer, Start-TC, Audio-Spuren/Kanäle/Layout, Encoder-Angaben (inkl. x264-Optionen) | – |
 | `interlace` | Feldreihenfolge aus den Metadaten, gemessene Anteile interlaced/progressiv, `rating`: `interlaced` / `progressive` / `unclear`, `trust` | `interlaced` → deinterlacen; `progressive` → nichts |
-| `black_bars` | obere/untere Ränder, `bars.left = bars.right = 0`, aktive Fläche, `rating` und `trust` | nur oben/unten beschneiden, `extra_crop` ausschließlich an einer Seite mit erkanntem Rand |
+| `black_bars` | obere/untere Ränder, `bars.left = bars.right = 0`, aktive Fläche, `rating` und `trust` | nur oben/unten beschneiden, `extra_crop` ausschließlich an einer Seite mit erkanntem Rand; mit `sides = true` bei festem Rahmen und `fit = "contain"` zusätzlich Seitenbalken beschneiden, falls das Bild sonst oben/unten Balken bekäme |
 | `audio` | je Kanal Anteil mit Pegel ≥ Schwelle und Spitzenpegel, `audible` (Liste der hörbaren Kanäle), je Kanalpaar Ähnlichkeit (unabhängig von Pegel und Polung), Zeitversatz, Pegelunterschied und Polung (`inverted`), `duplicates`, `trust` | siehe unten |
 
 - **Stichproben:** über die Laufzeit verteilt (`samples.per_minute`, `samples.seconds`) oder über die volle Länge (`samples.full`).
 - **Statistik:** Die Stichproben werden gemeinsam ausgewertet; Ausreißer fallen heraus, z. B. Schwarz am Anfang und Ende oder sehr dunkle Szenen bei `black_bars`. Jede Bewertung hat ein `trust` von 0 bis 1 aus Anzahl und Übereinstimmung der Stichproben (bei `samples.full` für den Ton 1).
 - **Sicherheit:** Ein Fix ändert nur, wenn seine Bewertung mindestens das `trust` seines Abschnitts erreicht; sonst `error` mit Bewertung und erreichter Sicherheit. Für vage Fälle `trust` erhöhen, z. B. `"audio": {"trust": 0.99}`. Beim Ton wird `trust` auf zwei Nachkommastellen gerundet verglichen, z. B. erreicht 0.897 die Schwelle 0.9.
-- **`black_bars`:** Nur Zeilen oben/unten werden bewertet. Schwarz liegt nach Graustufendecodierung bei 0, Toleranz 6 von 255; ein dunklerer Bildbereich wird nicht zum Schwarzreferenzwert erklärt. Verwendet wird der kleinste Rand über alle gültigen Bilder; seitliche Balken lösen keinen Fix aus. Die Erkennung bleibt stichprobenbasiert: Für die ersten Läufe Master manuell vergleichen.
+- **`black_bars`:** Nur Zeilen oben/unten werden bewertet. Schwarz liegt nach Graustufendecodierung bei 0, Toleranz 6 von 255; ein dunklerer Bildbereich wird nicht zum Schwarzreferenzwert erklärt. Verwendet wird der kleinste Rand über alle gültigen Bilder; seitliche Balken lösen ohne `sides = true` keinen Fix aus. Die Erkennung bleibt stichprobenbasiert: Für die ersten Läufe Master manuell vergleichen. Seitenbalken werden nur bewertet, wenn das Bild nach dem Beschnitt breiter als der Rahmen ist. Erkannt werden sie relativ, ohne festen Schwarzwert: niedriger Pegel (≤ 64 von 255), über die Stichproben konstant, in sich gleichmäßig, links und rechts gleich hell und gleich breit; beschnitten wird bis zum Seitenverhältnis des Rahmens, höchstens bis an die Bildkante.
 - **`interlace`:** Die Metadaten sind die erste Angabe; die Messung bestätigt sie. Mit `"interlace": {"source": "metadata"}` gilt nur die Angabe in den Metadaten, ohne Messung.
 - **Stille/Kanalerkennung:** Je `audio.silence_window` wird der RMS-Pegel jedes Kanals in dBFS verglichen. Ein Fenster ist auswertbar, wenn mindestens ein Kanal `audio.silence_threshold` erreicht. In einem auswertbaren Fenster gilt ein Kanal als stumm, wenn er unter `audio.silence_threshold` und zugleich mindestens `audio.silence_gap` unter dem lautesten Kanal liegt; sonst gilt er als hörbar. Ein Kanal wird als hörbar bewertet, wenn mindestens die Hälfte seiner Stimmen hörbar ist. Gibt es kein auswertbares Fenster, gelten alle Kanäle als stumm. Die Sicherheit (`trust`) richtet sich nach Zahl und Verteilung der Stimmen; bei `samples.full` ist sie 1.
 - **Kanalvergleich:** Je Stichprobe wird für jedes Kanalpaar, dessen Kanäle beide `audio.silence_threshold` erreichen, der stärkste Gleichlauf innerhalb von ±`audio.max_offset_ms` gesucht. Die Ähnlichkeit ist sein Betrag; eine verpolte Kopie erreicht damit dieselbe Ähnlichkeit wie eine gleich gepolte und wird mit `inverted: true` gemeldet. `offset_ms` und `level_db` beziehen sich auf diesen Gleichlauf. Ein Paar gilt als doppelt, wenn in mindestens der Hälfte der verglichenen Stichproben die Ähnlichkeit `audio.duplicate_min` erreicht.
@@ -174,6 +174,7 @@ transcoder.render(src, web)
 | `interlace` | `source` | `"analyse"` | `"analyse"`: Metadaten plus Messung; `"metadata"`: nur Metadaten |
 | `interlace` | `trust` | `0.9` | geforderte Sicherheit, ab der der Fix ändert (0 bis 1) |
 | `black_bars` | `extra_crop` | `0` | zusätzliche Pixel je Seite mit Rand beim Beschnitt; Seiten ohne Rand bleiben unverändert |
+| `black_bars` | `sides` | `False` | Seitenbalken beschneiden, wenn das Einpassen in einen festen Rahmen sonst oben/unten Balken erzeugt |
 | `black_bars` | `trust` | `0.9` | wie oben |
 | `audio` | `silence_threshold` | `"-60dB"` | Pegelschwelle (RMS je Fenster); ein Fenster ist auswertbar, wenn mindestens ein Kanal sie erreicht |
 | `audio` | `silence_gap` | `"20dB"` | Mindestabstand zum lautesten Kanal, damit ein Kanal im auswertbaren Fenster als stumm gilt (zusätzlich muss sein Pegel unter `silence_threshold` liegen) |
@@ -468,7 +469,7 @@ Voraussetzung: `ffmpeg` und `ffprobe` liegen in `res/`, sonst bricht der Build a
 
 | Eintrag | Wert | Bedeutung |
 |---|---|---|
-| `app_version` | `0.4.1` | Version der EXE (`transcode_marathon`) |
+| `app_version` | `0.5.0` | Version der EXE (`transcode_marathon`) |
 | `expected_silence` | `{"LYNXarchive": ("LA",), "Historiathek": ("H",)}` | Kollektion und Identifier-Präfixe, für die fehlender Ton erwartet wird (siehe Use-Case-Logik) |
 | `root_path` | `\\10.0.77.11\Ablage KI Proxy_1\Proxy 10 Mbit` | Wurzel der Marathon-Freigabe, wie `root_path` in Marathons `res/config.ini` |
 | `work_dir` | `.marathon` | Arbeitsordner von Marathon, wie `work_dir` in Marathons `res/config.ini` |
@@ -480,10 +481,10 @@ Voraussetzung: `ffmpeg` und `ffprobe` liegen in `res/`, sonst bricht der Build a
 | `master_preset` | `dnxhr_hqx` | Master aus progressiven Quellen: Quellbildgröße, proportionaler Beschnitt/Zoom, PCM-Einzelspuren 48 kHz/24 Bit |
 | `master_preset_interlaced` | `dnxhd_185x` | Master aus interlaced Quellen: 1920×1080, Quell-Feldreihenfolge, 25 Frames/s; andere fps → Fehler ohne Transcode |
 | `ffe_black_seconds` | `1` | Schwarz zwischen Tafel und Film |
-| `settings` | `{"samples": {"per_minute": 5, "seconds": 2}, "black_bars": {"extra_crop": 10}}` | Marathon-Vorgaben: 5 Stichproben pro Minute à 2 Sekunden, zusätzlicher Beschnitt 10 Pixel; QC-Schwellen unverändert |
+| `settings` | `{"samples": {"per_minute": 5, "seconds": 2}, "black_bars": {"extra_crop": 0, "sides": True}}` | Marathon-Vorgaben: 5 Stichproben pro Minute à 2 Sekunden, kein zusätzlicher Beschnitt, Seitenbalken-Beschnitt beim Proxy; QC-Schwellen unverändert |
 | `log_progress_seconds` | `30` | Abstand der Fortschrittswerte im Log; laufende Konsolenanzeige bleibt erhalten |
 
-Die Halbierung betrifft nur die Marathon-Vorgabe `settings.samples.per_minute`: 5 statt 10. `seconds = 2`, `full = false`, Vertrauensschwellen, Audio-Grenzwerte und `black_bars.extra_crop = 10` bleiben unverändert. Die Standardwerte des Kerns und anderer Apps werden nicht halbiert. Bei kurzen Clips können weniger Stichproben häufiger zu einer unsicheren Bewertung führen; die QC-Schwellen werden dafür nicht abgesenkt. Es werden keine Quellen automatisch auf lokale Laufwerke kopiert.
+Die Halbierung betrifft nur die Marathon-Vorgabe `settings.samples.per_minute`: 5 statt 10. `seconds = 2`, `full = false`, Vertrauensschwellen, Audio-Grenzwerte und `black_bars.extra_crop = 0` bleiben unverändert. Die Standardwerte des Kerns und anderer Apps werden nicht halbiert. Bei kurzen Clips können weniger Stichproben häufiger zu einer unsicheren Bewertung führen; die QC-Schwellen werden dafür nicht abgesenkt. Es werden keine Quellen automatisch auf lokale Laufwerke kopiert.
 
 ### Ergebnis eines Jobs
 

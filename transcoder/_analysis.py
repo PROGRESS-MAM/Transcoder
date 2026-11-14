@@ -1,6 +1,7 @@
 """Settings, analysis checks and fix rules of the transcoder."""
 # --------- IMPORTS ---------
 from collections.abc import Callable, Iterable, Iterator
+from fractions import Fraction
 from itertools import combinations, zip_longest
 from statistics import median
 import copy
@@ -16,13 +17,23 @@ from ._source import Source
 defaults = {
     "samples": {"per_minute": 6, "seconds": 2, "full": False},
     "interlace": {"source": "analyse", "trust": 0.9},
-    "black_bars": {"extra_crop": 0, "trust": 0.9},
+    "black_bars": {"extra_crop": 0, "trust": 0.9, "sides": False},
     "audio": {"silence_threshold": "-60dB", "silence_window": "1s", "silence_gap": "20dB",
               "duplicate_min": 0.9, "max_offset_ms": 40, "trust": 0.9},
 }
 bars_fps = 4                    # frames per second read from a sample for black_bars
 bars_full_fps = 1               # the same with samples.full
 black_tolerance = 6.0           # 8-bit steps above the black level that still count as black (noise, grain)
+side_flat_std = 2.0             # Ignore flat frames when measuring side levels
+side_min_frames = 5             # Minimum frames required for side measurements
+side_level_max = 64.0           # Maximum accepted side brightness
+side_level_tolerance = 4.0      # Maximum side-level variation
+side_spread_max = 4.0           # Maximum per-column brightness spread
+side_change_max = 4.0           # Maximum per-column frame-to-frame change
+side_min_px = 4                 # Minimum detectable side width
+side_width_tolerance_px = 4     # Minimum allowed left/right width mismatch
+side_width_tolerance_share = 0.01  # Relative allowed left/right width mismatch
+side_max_share = 0.4            # Maximum side width as a share of the image
 full_block_seconds = 10         # audio with samples.full is compared in blocks of this length
 compare_rate = 8000             # audio is compared at about this sample rate
 sample_bytes = 4                # audio is decoded as 32 bit float
@@ -35,7 +46,7 @@ idet_pattern = re.compile(r"Multi frame detection:\s*TFF:\s*(\d+)\s*BFF:\s*(\d+)
                           r"\s*Undetermined:\s*(\d+)")
 op_atom_marker = "0d010201.10"  # OP-Atom in the operational pattern UL
 Progress = Callable[[str, float], None]
-FrameLines = tuple[np.ndarray, np.ndarray]
+FrameLines = tuple[np.ndarray, np.ndarray, tuple[np.ndarray, np.ndarray] | None]
 FieldCounts = tuple[int, int, int, int]
 
 
@@ -91,6 +102,8 @@ def _validate(check: str, values: dict) -> None:
         raise ValueError(f"interlace.source muss {' oder '.join(interlace_sources)} sein.")
     if check == "black_bars" and (not isinstance(values["extra_crop"], int) or values["extra_crop"] < 0):
         raise ValueError(f"black_bars.extra_crop muss eine ganze Zahl ab 0 sein, erhalten {values['extra_crop']!r}.")
+    if check == "black_bars" and not isinstance(values["sides"], bool):
+        raise ValueError("black_bars.sides muss True oder False sein.")
     if check == "audio":
         _media.decibel(values["silence_threshold"], "audio.silence_threshold")
         if _media.decibel(values["silence_gap"], "audio.silence_gap") <= 0:
@@ -239,10 +252,13 @@ def check_interlace(source: Source, values: dict, progress: Progress) -> dict:
 # --------- FUNC BLACK BARS ---------
 def _gray_lines(chunk: bytes, width: int, height: int) -> FrameLines:
     frame = np.frombuffer(chunk, np.uint8).reshape(height, width)
-    return frame.mean(axis=1, dtype=np.float32), frame.mean(axis=0, dtype=np.float32)
+    rows, cols = frame.mean(axis=1, dtype=np.float32), frame.mean(axis=0, dtype=np.float32)
+    band = frame[height // 4:height - height // 4]
+    sides = (band.mean(axis=0, dtype=np.float32), band.std(axis=0, dtype=np.float32)) if float(frame.std()) > side_flat_std else None
+    return rows, cols, sides
 
 
-def _frames_lines(source: Source, start: float, length: float, full: bool) -> Iterator[tuple[np.ndarray, np.ndarray]]:
+def _frames_lines(source: Source, start: float, length: float, full: bool) -> Iterator[FrameLines]:
     ref, width, height = source.video, source.width, source.height
     args = [*_seek(start, length, full), "-i", str(source.files[ref.file]), "-map", f"0:v:{ref.ordinal}", "-an",
             "-vf", f"fps={bars_full_fps if full else bars_fps},format=gray", "-f", "rawvideo", "pipe:1"]
@@ -257,9 +273,39 @@ def _edge(lines: np.ndarray, limit: float) -> int:
     return int(above[0]) if above.size else len(lines)
 
 
+def _side_edge(level: np.ndarray, change: np.ndarray, spread: np.ndarray) -> int:
+    ref = level[0]
+    invalid = ((change > side_change_max) | (spread > side_spread_max)
+               | (np.abs(level - ref) > side_level_tolerance))
+    first = np.flatnonzero(invalid)
+    return int(first[0]) if first.size else len(level)
+
+
+def _side_bars(samples: list[list[FrameLines]]) -> dict | None:
+    measured = [(level, spread) for frames in samples for rows, _, sides in frames
+                if sides is not None and rows.max() > black_tolerance
+                for level, spread in [sides]]
+    if len(measured) < side_min_frames:
+        return None
+    levels = np.stack([level for level, _ in measured])
+    level, change = levels.mean(axis=0), levels.max(axis=0) - levels.min(axis=0)
+    spread = np.median(np.stack([item for _, item in measured]), axis=0)
+    left, right = _side_edge(level, change, spread), _side_edge(level[::-1], change[::-1], spread[::-1])
+    size = len(level)
+    tolerance = max(side_width_tolerance_px, round(size * side_width_tolerance_share))
+    if (left < side_min_px or right < side_min_px or left > size * side_max_share
+            or right > size * side_max_share or abs(left - right) > tolerance):
+        return None
+    level_left, level_right = float(level[:left].mean()), float(level[size - right:].mean())
+    if abs(level_left - level_right) > side_level_tolerance or max(level_left, level_right) > side_level_max:
+        return None
+    return {"left": left, "right": right, "level_left": round(level_left, 1),
+            "level_right": round(level_right, 1)}
+
+
 def _rate_black_bars(source: Source, values: dict, samples: list[list[FrameLines]]) -> dict:
     full = values["samples"]["full"]
-    rows_found = [rows for frames in samples for rows, _ in frames]
+    rows_found = [rows for frames in samples for rows, *_ in frames]
     if not rows_found:
         return {"rating": "unclear", "trust": 0.0, "reason": "keine Bilder lesbar"}
     # Gray decoding expands video black to zero; a dark gradient is not a black reference.
@@ -267,7 +313,7 @@ def _rate_black_bars(source: Source, values: dict, samples: list[list[FrameLines
     black = float(min(rows.min() for rows in rows_found))
     sides = []
     for frames in samples:
-        valid = [rows for rows, _ in frames if rows.max() > limit]
+        valid = [rows for rows, *_ in frames if rows.max() > limit]
         if valid:
             sides.append([(_edge(rows, limit), _edge(rows[::-1], limit)) for rows in valid])
     if not sides:
@@ -281,7 +327,8 @@ def _rate_black_bars(source: Source, values: dict, samples: list[list[FrameLines
     trust = 1.0 if rating == "none" else round((voters + 1) / (voters + 2), 4)
     return {"rating": rating, "trust": trust, "black_level": round(black, 1), "bars": bars, "active": active,
             "size": (source.width, source.height), "samples": len(samples), "valid_samples": len(sides),
-            "black_samples": len(samples) - len(sides)}
+            "black_samples": len(samples) - len(sides),
+            "sides": _side_bars(samples) if values["sides"] else None}
 
 
 def check_black_bars(source: Source, values: dict, progress: Progress) -> dict:
@@ -479,19 +526,39 @@ def fix_interlace(found: dict, values: dict, scan: str) -> tuple[dict, str | Non
     return {}, None
 
 
-def fix_black_bars(found: dict, values: dict, width: int, height: int) -> tuple[dict, str | None]:
-    """Crop top and bottom only; retain field alignment for interlaced video."""
+def side_crop(box: tuple[int, int, int, int] | None, sides: dict | None, width: int, height: int,
+              sar: Fraction, frame: tuple[int, int, Fraction]) -> tuple[int, int, int, int] | None:
+    x, y, w, h = box or (0, 0, width, height)
+    fw, fh, fs = frame
+    if not sides or Fraction(w) * sar / h <= Fraction(fw) * fs / fh:
+        return None
+    content_left, content_right = max(x, sides["left"]), min(x + w, width - sides["right"])
+    desired = math.floor(Fraction(h) * fw * fs / (fh * sar))
+    crop_width = max(content_right - content_left, min(w, desired))
+    left = min(max(content_left - (crop_width - (content_right - content_left)) // 2, x), x + w - crop_width)
+    right = left + crop_width
+    left, right = left - left % 2, min(x + w, right + right % 2)
+    return None if (left, right) == (x, x + w) else (left, y, right - left, h)
+
+
+def fix_black_bars(found: dict, values: dict, width: int, height: int, sar: Fraction = Fraction(1),
+                   frame: tuple[int, int, Fraction] | None = None) -> tuple[dict, str | None]:
+    """Crop detected borders while retaining field alignment for interlaced video."""
     _sure(found, values["trust"], "Schwarze Ränder")
     bars, extra = found.get("bars", {}), values["extra_crop"]
-    if found["rating"] == "none" or not (bars.get("top") or bars.get("bottom")):
+    box = None
+    if found["rating"] != "none" and (bars.get("top") or bars.get("bottom")):
+        top = bars.get("top", 0) + (extra if bars.get("top") else 0)
+        bottom = height - bars.get("bottom", 0) - (extra if bars.get("bottom") else 0)
+        top, bottom = top + top % 2, bottom - bottom % 2
+        if bottom - top < 2:
+            raise FixError(f"Schwarze Ränder: keine Bildfläche übrig ({bars}).")
+        box = (0, top, width, bottom - top)
+    if frame and values["sides"]:
+        box = side_crop(box, found.get("sides"), width, height, sar, frame) or box
+    if box is None:
         return {}, None
-    top = bars.get("top", 0) + (extra if bars.get("top") else 0)
-    bottom = height - bars.get("bottom", 0) - (extra if bars.get("bottom") else 0)
-    top, bottom = top + top % 2, bottom - bottom % 2
-    if bottom - top < 2:
-        raise FixError(f"Schwarze Ränder: keine Bildfläche übrig ({bars}).")
-    box = (0, top, width, bottom - top)
-    return {"crop": box}, f"beschnitten auf {box[2]}×{box[3]} bei 0,{box[1]}"
+    return {"crop": box}, f"beschnitten auf {box[2]}×{box[3]} bei {box[0]},{box[1]}"
 
 
 def fix_audio(found: dict, values: dict, target: dict, count: int) -> tuple[dict, str | None]:

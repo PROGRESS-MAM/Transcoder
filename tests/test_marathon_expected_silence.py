@@ -81,8 +81,8 @@ def test_config_and_expected_silence_matching_rules():
     assert not marathon._expected_silence(_job(collection="Historiathek", identifier="LA000674"))
 
 
-def test_app_version_is_0_4_1():
-    assert marathon.app_version == "0.4.1"
+def test_app_version_is_0_5_0():
+    assert marathon.app_version == "0.5.0"
 
 
 def test_expected_silence_without_channels_uses_stereo_silence(tmp_path):
