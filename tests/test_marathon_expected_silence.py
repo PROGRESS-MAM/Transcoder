@@ -66,11 +66,16 @@ def _run(job, channel_count, audible=None, trust=1.0, tmp_path=None):
 
 
 def test_config_and_expected_silence_matching_rules():
-    assert marathon.expected_silence == {"LYNXarchive": ("LA",), "Historiathek": ("H",)}
+    assert marathon.expected_silence == {"LYNXarchive": ("LA",), "Historiathek": ("H",), "DEFA Videoarchive B-Roll": ("DEFA",)}
     assert marathon._expected_silence(_job(identifier=" LA000674 "))
     assert not marathon._expected_silence(_job(identifier="la000674"))
     assert not marathon._expected_silence(_job(collection="lynxarchive"))
     assert not marathon._expected_silence(_job(collection="LYNXarchive2"))
+    assert marathon._expected_silence(_job(collection="DEFA Videoarchive B-Roll", identifier=" DEFA18458 "))
+    assert marathon._expected_silence(_job(collection="DEFA Videoarchive B-Roll", identifier="DEFA18532_14"))
+    assert not marathon._expected_silence(_job(collection="DEFA Videoarchive B-Roll", identifier="defa18458"))
+    assert not marathon._expected_silence(_job(collection="DEFA Videoarchive B-roll", identifier="DEFA18458"))
+    assert not marathon._expected_silence(_job(collection="DEFA Der Augenzeuge", identifier="DEFA18458"))
     assert not marathon._expected_silence(_job(collection="DEFA Der Augenzeuge"))
     assert not marathon._expected_silence(_job(identifier="PROB1051"))
     assert not marathon._expected_silence(_job(collection=None))
@@ -81,8 +86,8 @@ def test_config_and_expected_silence_matching_rules():
     assert not marathon._expected_silence(_job(collection="Historiathek", identifier="LA000674"))
 
 
-def test_app_version_is_0_5_0():
-    assert marathon.app_version == "0.5.0"
+def test_app_version_is_0_5_1():
+    assert marathon.app_version == "0.5.1"
 
 
 def test_expected_silence_without_channels_uses_stereo_silence(tmp_path):
@@ -178,3 +183,48 @@ def test_silent_channels_without_rule_keep_existing_audio_fix_path(tmp_path):
     assert output.call_args.args[2][0][0] == "audio"
     assert "silent_audio" not in output.call_args.kwargs
     assert output.call_args.kwargs["modify"] == ()
+
+
+def test_defa_b_roll_without_channels_uses_stereo_silence(tmp_path):
+    job = _job(collection="DEFA Videoarchive B-Roll", identifier="DEFA18458")
+    report, _, output, audio_problem, _, log = _run(job, 0, tmp_path=tmp_path)
+
+    assert report.status == "ok"
+    audio_problem.assert_not_called()
+    assert output.call_args.kwargs["silent_audio"] is True
+    assert output.call_args.kwargs["modify"] == ()
+    assert any("Ton fehlt erwartungsgemäß (DEFA Videoarchive B-Roll, DEFA18458): stille Stereospur" in call.args[0]
+               for call in log.call_args_list)
+
+
+def test_defa_b_roll_with_silent_channels_maps_stereo(tmp_path):
+    job = _job(collection="DEFA Videoarchive B-Roll", identifier="DEFA18458")
+    report, _, output, audio_problem, fix, log = _run(job, 2, trust=0.01, tmp_path=tmp_path)
+
+    assert report.status == "ok"
+    audio_problem.assert_not_called()
+    assert all(not (call.args and call.args[0] == "audio") for call in fix.call_args_list)
+    assert output.call_args.kwargs["modify"][0].value == [1, 2]
+    assert "silent_audio" not in output.call_args.kwargs
+    assert any("audio_map([1, 2])" in call.args[0] for call in log.call_args_list)
+
+
+def test_defa_b_roll_with_audible_channels_keeps_audio_fix(tmp_path):
+    job = _job(collection="DEFA Videoarchive B-Roll", identifier="DEFA18458")
+    report, _, output, audio_problem, _, _ = _run(job, 2, audible=[1, 2], tmp_path=tmp_path)
+
+    assert report.status == "ok"
+    audio_problem.assert_called_once()
+    assert output.call_args.args[2][0][0] == "audio"
+    assert output.call_args.kwargs["modify"] == ()
+    assert "silent_audio" not in output.call_args.kwargs
+
+
+def test_defa_b_roll_ffe_tafel_remains_manual_even_with_audio():
+    job = _job(collection="DEFA Videoarchive B-Roll", identifier="DEFA18458", ffe_tafel=True,
+                ffe_reference_clips=["HD_1_66.mov"])
+    report, analyzed, output, _, _, _ = _run(job, 2, audible=[1, 2])
+
+    assert report.status == "rejected"
+    assert analyzed == []
+    output.assert_not_called()

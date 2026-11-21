@@ -9,3 +9,6 @@ dist/
 .venv/
 *.exe
 .monarch
+*.py[cod]
+.pytest_cache/
+.env

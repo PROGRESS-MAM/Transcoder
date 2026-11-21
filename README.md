@@ -1,6 +1,6 @@
 # Transcoder
 
-> **Versionen:** `transcoder` 0.5.0, `transcode_marathon` 0.5.0. Vor dem ersten Einsatz des NVIDIA-Proxys ffmpeg, GPU und Treiber mit den Befehlen unter „NVIDIA-Proxy“ prüfen. Für den EXE-Betrieb nach Änderungen einen neuen Windows-Build erstellen.
+> **Versionen:** `transcoder` 0.5.0, `transcode_marathon` 0.5.1. Vor dem ersten Einsatz des NVIDIA-Proxys ffmpeg, GPU und Treiber mit den Befehlen unter „NVIDIA-Proxy“ prüfen. Für den EXE-Betrieb nach Änderungen einen neuen Windows-Build erstellen.
 
 Rendert Mediendateien mit ffmpeg und analysiert sie. Ganz unten stehen zwei Betriebsarten:
 
@@ -441,7 +441,7 @@ Je Job: Source aus `inputs` und Streams. Bei vorhandenen Audiokanälen folgt die
 - Im Normalfall: `proxy_preset` mit `fix("audio", channels=2)`, `fix("black_bars")` und `fix("interlace")`.
 - Ein neuer Master wird nur bei `"ffe_tafel": true` erstellt. Dann wählt der Adapter aus `ffe_reference_clips` die eine Tafel mit Bildgröße und fps der Source (keine oder mehrere → manuelle Prüfung). Proxy und Master bekommen `merge = [<Tafel>, black(ffe_black_seconds), SOURCE]` und `timecode(anchor=SOURCE)`: Tafel (9 s) plus 1 s Schwarz = 10 s vor dem Film, der Film beginnt beim alten Start-TC. Der Master wird passend zur Interlaceanalyse mit `master_preset` (progressiv) oder `master_preset_interlaced` (interlaced) erstellt. Ohne FFE-Tafel entsteht kein neuer Master.
 - Ist ein neuer Master nötig und das Interlacing unklar, endet der Job ohne Rendern mit `rejected`.
-- **Erwartete Stille:** `expected_silence = {"LYNXarchive": ("LA",), "Historiathek": ("H",)}` ordnet jeder Kollektion ihre Identifier-Präfixe zu: `LYNXarchive` → `LA`, `Historiathek` → `H`. Die Kollektion muss exakt passen; beim Identifier werden äußere Leerzeichen entfernt, das Präfix ist groß-/kleinschreibungssensitiv. Fehlt eines der Felder, greift die Regel nicht.
+- **Erwartete Stille:** `expected_silence = {"LYNXarchive": ("LA",), "Historiathek": ("H",), "DEFA Videoarchive B-Roll": ("DEFA",)}` ordnet jeder Kollektion ihre Identifier-Präfixe zu: `LYNXarchive` → `LA`, `Historiathek` → `H`, `DEFA Videoarchive B-Roll` → `DEFA`. Die Kollektion muss exakt passen; beim Identifier werden äußere Leerzeichen entfernt, das Präfix ist groß-/kleinschreibungssensitiv. Fehlt eines der Felder, greift die Regel nicht.
   - Hat eine passende Source keine Audiokanäle, entfallen Audioanalyse und Audio-Fix; der Proxy erhält mit `silent_audio=True` eine stille Stereospur über die volle Länge. Ohne passende Regel wird „Source hat keinen Ton“ manuell geprüft.
   - Hat die passende Source Audiokanäle, aber keinen als hörbar bewerteten Kanal, wird unabhängig vom `trust` der Audio-Fix ausgelassen und stattdessen `audio_map([1, 2])` verwendet; bei genau einem Quellkanal `audio_map([1, 1])`.
   - Erwartete Stille zusammen mit `"ffe_tafel": true` wird manuell geprüft.
@@ -469,8 +469,8 @@ Voraussetzung: `ffmpeg` und `ffprobe` liegen in `res/`, sonst bricht der Build a
 
 | Eintrag | Wert | Bedeutung |
 |---|---|---|
-| `app_version` | `0.5.0` | Version der EXE (`transcode_marathon`) |
-| `expected_silence` | `{"LYNXarchive": ("LA",), "Historiathek": ("H",)}` | Kollektion und Identifier-Präfixe, für die fehlender Ton erwartet wird (siehe Use-Case-Logik) |
+| `app_version` | `0.5.1` | Version der EXE (`transcode_marathon`) |
+| `expected_silence` | `{"LYNXarchive": ("LA",), "Historiathek": ("H",), "DEFA Videoarchive B-Roll": ("DEFA",)}` | Kollektion und Identifier-Präfixe, für die fehlender Ton erwartet wird (siehe Use-Case-Logik) |
 | `root_path` | `\\10.0.77.11\Ablage KI Proxy_1\Proxy 10 Mbit` | Wurzel der Marathon-Freigabe, wie `root_path` in Marathons `res/config.ini` |
 | `work_dir` | `.marathon` | Arbeitsordner von Marathon, wie `work_dir` in Marathons `res/config.ini` |
 | `master_dir` | `\\10.0.77.11\Ablage KI Proxy_1\++ Master repariert` | nur zum Kürzen der Pfade, wie `[ingest] master_dir` |
