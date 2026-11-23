@@ -205,7 +205,7 @@ def test_audio_duplicate_min_defaults_to_0_9():
     assert analysis.section("audio")["duplicate_min"] == 0.9
 
 
-def test_transcoder_version_is_0_5_0():
+def test_transcoder_version_is_0_5_1():
     from transcoder import transcoder
 
-    assert transcoder.app_version == "0.5.0"
+    assert transcoder.app_version == "0.5.1"

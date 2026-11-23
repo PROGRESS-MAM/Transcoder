@@ -16,7 +16,7 @@ from ._source import Source
 # --------- CONFIG ---------
 defaults = {
     "samples": {"per_minute": 6, "seconds": 2, "full": False},
-    "interlace": {"source": "analyse", "trust": 0.9},
+    "interlace": {"source": "analyse", "trust": 0.9, "metadata_fallback": False},
     "black_bars": {"extra_crop": 0, "trust": 0.9, "sides": False},
     "audio": {"silence_threshold": "-60dB", "silence_window": "1s", "silence_gap": "20dB",
               "duplicate_min": 0.9, "max_offset_ms": 40, "trust": 0.9},
@@ -100,6 +100,8 @@ def _validate(check: str, values: dict) -> None:
         raise ValueError(f"{check}.trust muss zwischen 0 und 1 liegen, erhalten {values['trust']!r}.")
     if check == "interlace" and values["source"] not in interlace_sources:
         raise ValueError(f"interlace.source muss {' oder '.join(interlace_sources)} sein.")
+    if check == "interlace" and not isinstance(values["metadata_fallback"], bool):
+        raise ValueError("interlace.metadata_fallback muss True oder False sein.")
     if check == "black_bars" and (not isinstance(values["extra_crop"], int) or values["extra_crop"] < 0):
         raise ValueError(f"black_bars.extra_crop muss eine ganze Zahl ab 0 sein, erhalten {values['extra_crop']!r}.")
     if check == "black_bars" and not isinstance(values["sides"], bool):
@@ -230,10 +232,16 @@ def _rate_interlace(source: Source, values: dict, measurements: Iterable[FieldCo
     order = "tff" if totals[0] >= totals[1] else "bff"
     if rating == "interlaced" and max(totals[:2]) < 2 * min(totals[:2]):
         rating, trust = "unclear", 0.0      # samples disagree on the field order
-    return {**report, "rating": rating, "trust": trust if voters else 0.0,
-            "field_order": order if rating == "interlaced" else None,
-            "frames": dict(zip(("tff", "bff", "progressive", "undetermined"), totals)), "votes": votes,
-            "voters": voters, "agrees": meta_rating == rating if meta_rating and rating != "unclear" else None}
+    result = {**report, "rating": rating, "trust": trust if voters else 0.0,
+              "field_order": order if rating == "interlaced" else None,
+              "frames": dict(zip(("tff", "bff", "progressive", "undetermined"), totals)), "votes": votes,
+              "voters": voters, "agrees": meta_rating == rating if meta_rating and rating != "unclear" else None}
+    if (values["metadata_fallback"] and meta_rating is not None
+            and (result["rating"] == "unclear" or _below(result["trust"], values["trust"]))):
+        return {**result, "rating": meta_rating, "trust": 1.0,
+                "field_order": metadata if meta_rating == "interlaced" else None,
+                "fallback": "metadata", "measured_rating": result["rating"], "measured_trust": result["trust"]}
+    return {**result, "fallback": None}
 
 
 def check_interlace(source: Source, values: dict, progress: Progress) -> dict:

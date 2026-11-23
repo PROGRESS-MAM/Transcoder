@@ -1,6 +1,6 @@
 # Transcoder
 
-> **Versionen:** `transcoder` 0.5.0, `transcode_marathon` 0.5.1. Vor dem ersten Einsatz des NVIDIA-Proxys ffmpeg, GPU und Treiber mit den Befehlen unter „NVIDIA-Proxy“ prüfen. Für den EXE-Betrieb nach Änderungen einen neuen Windows-Build erstellen.
+> **Versionen:** `transcoder` 0.5.1, `transcode_marathon` 0.5.2. Vor dem ersten Einsatz des NVIDIA-Proxys ffmpeg, GPU und Treiber mit den Befehlen unter „NVIDIA-Proxy“ prüfen. Für den EXE-Betrieb nach Änderungen einen neuen Windows-Build erstellen.
 
 Rendert Mediendateien mit ffmpeg und analysiert sie. Ganz unten stehen zwei Betriebsarten:
 
@@ -132,7 +132,7 @@ Jeder Output wird einzeln betrachtet: Ein Output mit Fehler (z. B. Fix nicht sic
 - **Statistik:** Die Stichproben werden gemeinsam ausgewertet; Ausreißer fallen heraus, z. B. Schwarz am Anfang und Ende oder sehr dunkle Szenen bei `black_bars`. Jede Bewertung hat ein `trust` von 0 bis 1 aus Anzahl und Übereinstimmung der Stichproben (bei `samples.full` für den Ton 1).
 - **Sicherheit:** Ein Fix ändert nur, wenn seine Bewertung mindestens das `trust` seines Abschnitts erreicht; sonst `error` mit Bewertung und erreichter Sicherheit. Für vage Fälle `trust` erhöhen, z. B. `"audio": {"trust": 0.99}`. Beim Ton wird `trust` auf zwei Nachkommastellen gerundet verglichen, z. B. erreicht 0.897 die Schwelle 0.9.
 - **`black_bars`:** Nur Zeilen oben/unten werden bewertet. Schwarz liegt nach Graustufendecodierung bei 0, Toleranz 6 von 255; ein dunklerer Bildbereich wird nicht zum Schwarzreferenzwert erklärt. Verwendet wird der kleinste Rand über alle gültigen Bilder; seitliche Balken lösen ohne `sides = true` keinen Fix aus. Die Erkennung bleibt stichprobenbasiert: Für die ersten Läufe Master manuell vergleichen. Seitenbalken werden nur bewertet, wenn das Bild nach dem Beschnitt breiter als der Rahmen ist. Erkannt werden sie relativ, ohne festen Schwarzwert: niedriger Pegel (≤ 64 von 255), über die Stichproben konstant, in sich gleichmäßig, links und rechts gleich hell und gleich breit; beschnitten wird bis zum Seitenverhältnis des Rahmens, höchstens bis an die Bildkante.
-- **`interlace`:** Die Metadaten sind die erste Angabe; die Messung bestätigt sie. Mit `"interlace": {"source": "metadata"}` gilt nur die Angabe in den Metadaten, ohne Messung.
+- **`interlace`:** Die Metadaten sind die erste Angabe; die Messung bestätigt sie. Mit `"interlace": {"source": "metadata"}` gilt nur die Angabe in den Metadaten, ohne Messung. Mit `"interlace": {"metadata_fallback": True}` gilt die Metadatenangabe (mit `trust` 1.0), wenn die Messung `unclear` ergibt oder unter `interlace.trust` liegt; der Report enthält dann `fallback: "metadata"` sowie `measured_rating` und `measured_trust`. Ohne Metadatenangabe bleibt das Messergebnis.
 - **Stille/Kanalerkennung:** Je `audio.silence_window` wird der RMS-Pegel jedes Kanals in dBFS verglichen. Ein Fenster ist auswertbar, wenn mindestens ein Kanal `audio.silence_threshold` erreicht. In einem auswertbaren Fenster gilt ein Kanal als stumm, wenn er unter `audio.silence_threshold` und zugleich mindestens `audio.silence_gap` unter dem lautesten Kanal liegt; sonst gilt er als hörbar. Ein Kanal wird als hörbar bewertet, wenn mindestens die Hälfte seiner Stimmen hörbar ist. Gibt es kein auswertbares Fenster, gelten alle Kanäle als stumm. Die Sicherheit (`trust`) richtet sich nach Zahl und Verteilung der Stimmen; bei `samples.full` ist sie 1.
 - **Kanalvergleich:** Je Stichprobe wird für jedes Kanalpaar, dessen Kanäle beide `audio.silence_threshold` erreichen, der stärkste Gleichlauf innerhalb von ±`audio.max_offset_ms` gesucht. Die Ähnlichkeit ist sein Betrag; eine verpolte Kopie erreicht damit dieselbe Ähnlichkeit wie eine gleich gepolte und wird mit `inverted: true` gemeldet. `offset_ms` und `level_db` beziehen sich auf diesen Gleichlauf. Ein Paar gilt als doppelt, wenn in mindestens der Hälfte der verglichenen Stichproben die Ähnlichkeit `audio.duplicate_min` erreicht.
 
@@ -173,6 +173,7 @@ transcoder.render(src, web)
 | `samples` | `full` | `False` | `True`: volle Länge statt Stichproben |
 | `interlace` | `source` | `"analyse"` | `"analyse"`: Metadaten plus Messung; `"metadata"`: nur Metadaten |
 | `interlace` | `trust` | `0.9` | geforderte Sicherheit, ab der der Fix ändert (0 bis 1) |
+| `interlace` | `metadata_fallback` | `False` | `True`: bei unklarer oder unsicherer Messung die Metadatenangabe verwenden |
 | `black_bars` | `extra_crop` | `0` | zusätzliche Pixel je Seite mit Rand beim Beschnitt; Seiten ohne Rand bleiben unverändert |
 | `black_bars` | `sides` | `False` | Seitenbalken beschneiden, wenn das Einpassen in einen festen Rahmen sonst oben/unten Balken erzeugt |
 | `black_bars` | `trust` | `0.9` | wie oben |
@@ -439,9 +440,17 @@ Als EXE: `transcode_marathon_<version>.exe` auf den Rechner kopieren und starten
 Je Job: Source aus `inputs` und Streams. Bei vorhandenen Audiokanälen folgt die Audioanalyse; nur wenn `expected_silence` greift und kein Kanal hörbar ist, entfällt der Audio-Fix. Ohne Audiokanäle wird die Audioanalyse nur bei passender `expected_silence` übersprungen, sonst endet der Job mit manueller Prüfung. Sofern die Verarbeitung fortgesetzt wird, folgen `black_bars`- und `interlace`-Analyse und danach ein `render`:
 
 - Im Normalfall: `proxy_preset` mit `fix("audio", channels=2)`, `fix("black_bars")` und `fix("interlace")`.
+- **Tonregel:** Scheitert `fix("audio", channels=2)`, wählt der Adapter die Stereobelegung selbst und verwendet `audio_map(...)` statt des Audio-Fixes. „Sicher stumm“ heißt: nicht hörbar und `trust` mindestens `audio.trust` (auf zwei Stellen gerundet). In dieser Reihenfolge:
+  - alle Kanäle sicher stumm → manuelle Prüfung (Ausnahme nur über `expected_silence`);
+  - genau ein Quellkanal → `[1, 1]`;
+  - Kanal 1 und 2 sicher stumm → die ersten zwei hörbaren Kanäle ab Kanal 3, bei genau einem dieser doppelt, bei keinem `[1, 2]`;
+  - nur Kanal 1 oder nur Kanal 2 sicher stumm → der andere doppelt (`[2, 2]` bzw. `[1, 1]`);
+  - sonst `[1, 2]` (z. B. unsichere Kanäle, weitere hörbare Kanäle ohne Dublette, unsichere Dubletten).
+  Das Log zeigt `Tonregel: <Grund> → audio_map([..])`.
+- Interlacing: Marathon setzt `interlace.metadata_fallback = True`; bei unklarer oder unsicherer Messung gilt die Feldreihenfolge aus den Metadaten.
 - Ein neuer Master wird nur bei `"ffe_tafel": true` erstellt. Dann wählt der Adapter aus `ffe_reference_clips` die eine Tafel mit Bildgröße und fps der Source (keine oder mehrere → manuelle Prüfung). Proxy und Master bekommen `merge = [<Tafel>, black(ffe_black_seconds), SOURCE]` und `timecode(anchor=SOURCE)`: Tafel (9 s) plus 1 s Schwarz = 10 s vor dem Film, der Film beginnt beim alten Start-TC. Der Master wird passend zur Interlaceanalyse mit `master_preset` (progressiv) oder `master_preset_interlaced` (interlaced) erstellt. Ohne FFE-Tafel entsteht kein neuer Master.
 - Ist ein neuer Master nötig und das Interlacing unklar, endet der Job ohne Rendern mit `rejected`.
-- **Erwartete Stille:** `expected_silence = {"LYNXarchive": ("LA",), "Historiathek": ("H",), "DEFA Videoarchive B-Roll": ("DEFA",)}` ordnet jeder Kollektion ihre Identifier-Präfixe zu: `LYNXarchive` → `LA`, `Historiathek` → `H`, `DEFA Videoarchive B-Roll` → `DEFA`. Die Kollektion muss exakt passen; beim Identifier werden äußere Leerzeichen entfernt, das Präfix ist groß-/kleinschreibungssensitiv. Fehlt eines der Felder, greift die Regel nicht.
+- **Erwartete Stille:** `expected_silence` ordnet jeder Kollektion ihre Identifier-Präfixe zu: `LYNXarchive` → `LA`, `Historiathek` → `H`, `DEFA Videoarchive B-Roll` → `DEFA`, `DEFA Videoarchive Cintec` → `DEFA06955`, `DEFA08247`, `DEFA01902`, `DEFA12880_2`, `DEFA Videoarchive Thomas Grimm` → `DEFA17661`, `DEFA02244_3`. Ein Präfix gilt auch für Teile mit Suffix (z. B. `DEFA01902_1`). Die Kollektion muss exakt passen; beim Identifier werden äußere Leerzeichen entfernt, das Präfix ist groß-/kleinschreibungssensitiv. Fehlt eines der Felder, greift die Regel nicht.
   - Hat eine passende Source keine Audiokanäle, entfallen Audioanalyse und Audio-Fix; der Proxy erhält mit `silent_audio=True` eine stille Stereospur über die volle Länge. Ohne passende Regel wird „Source hat keinen Ton“ manuell geprüft.
   - Hat die passende Source Audiokanäle, aber keinen als hörbar bewerteten Kanal, wird unabhängig vom `trust` der Audio-Fix ausgelassen und stattdessen `audio_map([1, 2])` verwendet; bei genau einem Quellkanal `audio_map([1, 1])`.
   - Erwartete Stille zusammen mit `"ffe_tafel": true` wird manuell geprüft.
@@ -469,8 +478,8 @@ Voraussetzung: `ffmpeg` und `ffprobe` liegen in `res/`, sonst bricht der Build a
 
 | Eintrag | Wert | Bedeutung |
 |---|---|---|
-| `app_version` | `0.5.1` | Version der EXE (`transcode_marathon`) |
-| `expected_silence` | `{"LYNXarchive": ("LA",), "Historiathek": ("H",), "DEFA Videoarchive B-Roll": ("DEFA",)}` | Kollektion und Identifier-Präfixe, für die fehlender Ton erwartet wird (siehe Use-Case-Logik) |
+| `app_version` | `0.5.2` | Version der EXE (`transcode_marathon`) |
+| `expected_silence` | siehe Use-Case-Logik | Kollektion und Identifier-Präfixe, für die fehlender Ton erwartet wird (siehe Use-Case-Logik) |
 | `root_path` | `\\10.0.77.11\Ablage KI Proxy_1\Proxy 10 Mbit` | Wurzel der Marathon-Freigabe, wie `root_path` in Marathons `res/config.ini` |
 | `work_dir` | `.marathon` | Arbeitsordner von Marathon, wie `work_dir` in Marathons `res/config.ini` |
 | `master_dir` | `\\10.0.77.11\Ablage KI Proxy_1\++ Master repariert` | nur zum Kürzen der Pfade, wie `[ingest] master_dir` |
@@ -481,7 +490,7 @@ Voraussetzung: `ffmpeg` und `ffprobe` liegen in `res/`, sonst bricht der Build a
 | `master_preset` | `dnxhr_hqx` | Master aus progressiven Quellen: Quellbildgröße, proportionaler Beschnitt/Zoom, PCM-Einzelspuren 48 kHz/24 Bit |
 | `master_preset_interlaced` | `dnxhd_185x` | Master aus interlaced Quellen: 1920×1080, Quell-Feldreihenfolge, 25 Frames/s; andere fps → Fehler ohne Transcode |
 | `ffe_black_seconds` | `1` | Schwarz zwischen Tafel und Film |
-| `settings` | `{"samples": {"per_minute": 5, "seconds": 2}, "black_bars": {"extra_crop": 0, "sides": True}}` | Marathon-Vorgaben: 5 Stichproben pro Minute à 2 Sekunden, kein zusätzlicher Beschnitt, Seitenbalken-Beschnitt beim Proxy; QC-Schwellen unverändert |
+| `settings` | `{"samples": {"per_minute": 5, "seconds": 2}, "interlace": {"metadata_fallback": True}, "black_bars": {"extra_crop": 0, "sides": True}}` | Marathon-Vorgaben: 5 Stichproben pro Minute à 2 Sekunden, Metadaten-Fallback bei unsicherer Interlace-Messung, kein zusätzlicher Beschnitt, Seitenbalken-Beschnitt beim Proxy; QC-Schwellen unverändert |
 | `log_progress_seconds` | `30` | Abstand der Fortschrittswerte im Log; laufende Konsolenanzeige bleibt erhalten |
 
 Die Halbierung betrifft nur die Marathon-Vorgabe `settings.samples.per_minute`: 5 statt 10. `seconds = 2`, `full = false`, Vertrauensschwellen, Audio-Grenzwerte und `black_bars.extra_crop = 0` bleiben unverändert. Die Standardwerte des Kerns und anderer Apps werden nicht halbiert. Bei kurzen Clips können weniger Stichproben häufiger zu einer unsicheren Bewertung führen; die QC-Schwellen werden dafür nicht abgesenkt. Es werden keine Quellen automatisch auf lokale Laufwerke kopiert.

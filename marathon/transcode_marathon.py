@@ -16,7 +16,7 @@ from transcoder._source import Source
 
 # --------- CONFIG ---------
 app_name = "Transcode Marathon"
-app_version = "0.5.1"
+app_version = "0.5.2"
 
 root_path = Path(r"\\10.0.77.11\Ablage KI Proxy_1\Proxy 10 Mbit")   # like root_path in Marathon's res/config.ini
 work_dir = ".marathon"                      # like work_dir in Marathon's res/config.ini
@@ -30,8 +30,13 @@ master_preset = "dnxhr_hqx"                 # new masters from progressive sourc
 master_preset_interlaced = "dnxhd_185x"     # new masters from interlaced sources
 ffe_black_seconds = 1                       # black between FFE plate and film
 log_progress_seconds = 30
-settings = {"samples": {"per_minute": 5, "seconds": 2}, "black_bars": {"extra_crop": 0, "sides": True}}
-expected_silence = {"LYNXarchive": ("LA",), "Historiathek": ("H",), "DEFA Videoarchive B-Roll": ("DEFA",)}
+settings = {"samples": {"per_minute": 5, "seconds": 2}, "interlace": {"metadata_fallback": True},
+           "black_bars": {"extra_crop": 0, "sides": True}}
+expected_silence = {
+    "LYNXarchive": ("LA",), "Historiathek": ("H",), "DEFA Videoarchive B-Roll": ("DEFA",),
+    "DEFA Videoarchive Cintec": ("DEFA06955", "DEFA08247", "DEFA01902", "DEFA12880_2"),
+    "DEFA Videoarchive Thomas Grimm": ("DEFA17661", "DEFA02244_3"),
+}
 # Halte per_minute × seconds ≤ 60
 
 
@@ -249,6 +254,28 @@ def _audio_problem(source: Source, found: dict) -> str | None:
     return None
 
 
+def _audio_fallback(found: dict, need: float) -> list[int] | None:
+    """Stereo channels when fix_audio fails; None keeps the manual check."""
+    ch = found["channels"]
+    silent = [not item["audible"] and not _analysis._below(item["trust"], need) for item in ch]
+    if all(silent):
+        return None
+    if len(ch) == 1:
+        return [ch[0]["channel"]] * 2
+    if silent[0] and silent[1]:
+        rest = [item["channel"] for item in ch[2:] if item["audible"]]
+        if len(rest) >= 2:
+            return rest[:2]
+        if len(rest) == 1:
+            return rest * 2
+        return [ch[0]["channel"], ch[1]["channel"]]
+    if silent[0]:
+        return [ch[1]["channel"]] * 2
+    if silent[1]:
+        return [ch[0]["channel"]] * 2
+    return [ch[0]["channel"], ch[1]["channel"]]
+
+
 def _render_source(source: Source, found: dict) -> Source:
     if not source.video or found.get("rating") not in ("progressive", "interlaced"):
         return source
@@ -328,15 +355,17 @@ def run_job(job: dict, output_folder: Path, log_path: Path) -> adapter.JobReport
         adapter.log(f"FFE-Tafel: {_short(plate)}")
         segment = transcoder.centered(plate, 1920, 1080) if fallback else plate
         merge, code = [segment, transcoder.black(ffe_black_seconds), transcoder.SOURCE], transcoder.timecode(anchor=transcoder.SOURCE)
-    map_silent_audio = False
+    map_silent_audio, audio_channels = False, None
     if not silent_audio:
         reports.update(transcoder.analyse(source, "audio", settings, _console))
         if "error" in reports["audio"]:
             return _manual([f"Analyse audio: {reports['audio']['error']}"], _name(proxy_preset))
         map_silent_audio = expected and not reports["audio"]["audible"]
-        if not map_silent_audio:
-            if problem := _audio_problem(source, reports["audio"]):
+        if not map_silent_audio and (problem := _audio_problem(source, reports["audio"])):
+            audio_channels = _audio_fallback(reports["audio"], _analysis.split_settings(settings)["audio"]["trust"])
+            if audio_channels is None:
                 return _manual([problem], _name(proxy_preset))
+            adapter.log(f"Tonregel: {problem} → audio_map({audio_channels})")
     reports.update(transcoder.analyse(source, checks[2:], settings, _console))
     if problems := [f"Analyse {name}: {report['error']}" for name, report in reports.items() if "error" in report]:
         return _manual(problems, _name(proxy_preset))
@@ -348,7 +377,7 @@ def run_job(job: dict, output_folder: Path, log_path: Path) -> adapter.JobReport
     source, refs = _without_opatom_refs(source)
     if refs > 0:
         adapter.log(f"OP-Atom-Verweise ignoriert: {refs}")
-    proxy_fixes = [] if silent_audio or map_silent_audio else [_fix("audio", channels=2)]
+    proxy_fixes = [] if silent_audio or map_silent_audio or audio_channels else [_fix("audio", channels=2)]
     proxy_fixes.extend((_fix("black_bars"), _fix("interlace")))
     modify = ()
     output_options = {}
@@ -359,6 +388,8 @@ def run_job(job: dict, output_folder: Path, log_path: Path) -> adapter.JobReport
         channels = [1, 1] if len(source.channels) == 1 else [1, 2]
         modify = (transcoder.audio_map(channels),)
         solution = f"audio_map({channels})"
+    elif audio_channels:
+        modify = (transcoder.audio_map(audio_channels),)
     if silent_audio or map_silent_audio:
         adapter.log(f"Ton fehlt erwartungsgemäß ({job['collection']}, {job['identifier'].strip()}): {solution}")
     items = [transcoder.output(proxy_preset, output_folder / job["proxy_name"], proxy_fixes, modify=modify,

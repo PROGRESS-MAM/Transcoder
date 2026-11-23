@@ -66,7 +66,7 @@ def _run(job, channel_count, audible=None, trust=1.0, tmp_path=None):
 
 
 def test_config_and_expected_silence_matching_rules():
-    assert marathon.expected_silence == {"LYNXarchive": ("LA",), "Historiathek": ("H",), "DEFA Videoarchive B-Roll": ("DEFA",)}
+    assert marathon.expected_silence == {"LYNXarchive": ("LA",), "Historiathek": ("H",), "DEFA Videoarchive B-Roll": ("DEFA",), "DEFA Videoarchive Cintec": ("DEFA06955", "DEFA08247", "DEFA01902", "DEFA12880_2"), "DEFA Videoarchive Thomas Grimm": ("DEFA17661", "DEFA02244_3")}
     assert marathon._expected_silence(_job(identifier=" LA000674 "))
     assert not marathon._expected_silence(_job(identifier="la000674"))
     assert not marathon._expected_silence(_job(collection="lynxarchive"))
@@ -86,8 +86,8 @@ def test_config_and_expected_silence_matching_rules():
     assert not marathon._expected_silence(_job(collection="Historiathek", identifier="LA000674"))
 
 
-def test_app_version_is_0_5_1():
-    assert marathon.app_version == "0.5.1"
+def test_app_version_is_0_5_2():
+    assert marathon.app_version == "0.5.2"
 
 
 def test_expected_silence_without_channels_uses_stereo_silence(tmp_path):
