@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 import sys
 
-import pruefe_balken as pb
+import oneoff.old.pruefe_balken as pb
 
 # --------- CONFIG ---------
 app_name = "Repariere Balken"
