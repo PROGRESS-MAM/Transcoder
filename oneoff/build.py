@@ -2,20 +2,18 @@
 from pathlib import Path
 import ast
 import os
-import shutil
 import sys
 import PyInstaller.__main__
 
 
 # --------- CONFIG ---------
 app_name = "Repariere Zeitstempel Build"
-app_version = "0.2.0"
+app_version = "0.3.0"
 
 here = Path(__file__).resolve().parent
 project = here.parent
 script = here / "repariere_zeitstempel.py"
-config_file = here / "config.ini"                        # template, copied next to the exe if none is there yet
-dist_folder = here / "dist"                              # exe and config.ini end up here
+dist_folder = here / "dist"                              # exe ends up here
 build_folder = project / "build" / "repariere_zeitstempel"
 tools = ("ffmpeg", "ffprobe")                            # must lie in res/ of the project, they are packed into the exe
 
@@ -50,8 +48,8 @@ def _version_file(name: str, version: str, exe_name: str) -> Path:
 
 # --------- MAIN ---------
 def main() -> None:
-    if missing := [path.name for path in (script, config_file) if not path.is_file()]:
-        sys.exit(f"{', '.join(missing)} fehlt in {here}.")
+    if not script.is_file():
+        sys.exit(f"{script.name} fehlt in {here}.")
     if missing := [tool for tool in tools if not any((project / "res").glob(f"{tool}*"))]:
         sys.exit(f"{' und '.join(missing)} {'fehlt' if len(missing) == 1 else 'fehlen'} in {project / 'res'}: "
                  f"für die EXE dort ablegen (ffmpeg.exe, ffprobe.exe).")
@@ -63,10 +61,7 @@ def main() -> None:
         "--version-file", str(_version_file(settings["app_name"], settings["app_version"], exe_name)),
         "--distpath", str(dist_folder), "--workpath", str(build_folder), "--specpath", str(build_folder),
     ])
-    target_config = dist_folder / config_file.name
-    if not target_config.exists():
-        shutil.copy2(config_file, target_config)
-    print(f"Fertig: {dist_folder / exe_name}.exe mit {target_config}")
+    print(f"Fertig: {dist_folder / exe_name}.exe")
 
 
 # --------- EXEC ---------
